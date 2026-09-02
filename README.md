@@ -23,20 +23,22 @@ fundamental-frequency (pitch) detection, frequency -> MIDI note
 conversion (note name, octave, cents deviation), a note-stabilization
 state machine (debounces raw pitch fluctuation into real MIDI Note On/Off
 events - the classic "a wobble must not spam Note On/Off/On/Off" problem),
-and a transport-independent MIDI event queue, all running as dedicated
-FreeRTOS tasks and displayed live on the on-board LCD plus rate-limited
-serial diagnostics. The pitch/note/state-machine logic is also covered by
-a real, passing host-side test suite - see "Testing" below.
+vocal-dynamics -> MIDI velocity mapping (a perceptual/log curve, not raw
+linear - see "Testing"), and a transport-independent MIDI event queue,
+all running as dedicated FreeRTOS tasks and displayed live on the
+on-board LCD plus rate-limited serial diagnostics. The pitch/note/
+state-machine/dynamics logic is also covered by a real, passing
+host-side test suite - see "Testing" below.
 
 **Not yet implemented**: an actual MIDI transport (BLE/UART - Note On/Off
 events are generated and queued for real today, but only reach a
-diagnostic log line, not a wire), CC11 expression, pitch bend, and
-refining velocity into full dynamics tracking. See "Roadmap" below and
-`docs/architecture.md` for the full milestone list. This is deliberate,
-incremental development, not an oversight - the project spec this
-firmware follows explicitly asks for each stage to be proven (on
-hardware, and where possible in an automated test) before the next is
-built on top of it.
+diagnostic log line, not a wire), CC11 expression (tracking dynamics
+*while a note is held*, as opposed to at its onset, which is what's
+implemented), pitch bend. See "Roadmap" below and `docs/architecture.md`
+for the full milestone list. This is deliberate, incremental development,
+not an oversight - the project spec this firmware follows explicitly
+asks for each stage to be proven (on hardware, and where possible in an
+automated test) before the next is built on top of it.
 
 ## Hardware
 
@@ -115,8 +117,8 @@ USB-Serial/JTAG, so no external USB-UART bridge or drivers are needed.)
 ## Testing
 
 The frequency<->MIDI-note conversion, RMS, envelope follower, YIN pitch
-detector, and note-stabilization state machine all have real,
-hardware-independent unit tests:
+detector, note-stabilization state machine, and dynamics->velocity
+mapping all have real, hardware-independent unit tests:
 
 ```sh
 cd test
@@ -124,10 +126,13 @@ make            # builds and runs every suite; fails loudly on any failure
 ```
 
 No ESP-IDF or board required - see `test/README.md` for what each suite
-actually checks. As of this writing: 459 checks across 5 suites, all
+actually checks. As of this writing: 467 checks across 6 suites, all
 passing - including a direct test of the spec's own anti-flicker
 requirement ("a small pitch fluctuation must not generate Note Off/On/Off/On
-continuously").
+continuously") and a measured demonstration that the default log velocity
+curve reads meaningfully higher than a raw linear one at ordinary singing
+levels (the spec's own warning against "poor musical behaviour" from a
+simple linear mapping).
 
 ## How to use it
 
@@ -162,16 +167,18 @@ including a real finding along the way: ESP32-C5 has no hardware FPU, and
 the first all-`float` YIN implementation measured ~79 ms/hop before being
 rewritten in fixed-point.
 
-The note-stabilization state machine's *logic* (Milestone 5) is verified
-by 248 host-side test checks rather than a live singing session in this
-particular verification pass - deliberately, not as a shortcut: its
-correctness lives in exact frame-by-frame/millisecond-boundary behavior
-(does a change get honored one frame too early? does a one-frame dropout
-wrongly release a note?) that a host test can assert on deterministically
-and a live mic session cannot. The hardware run confirms the *integration*
-- it boots, initializes the MIDI queue, and runs the whole pipeline with
-zero regressions - which is what hardware verification can actually add
-on top of the host tests here.
+The note-stabilization state machine's and velocity mapping's *logic*
+(Milestones 5-6) is verified by 256 host-side test checks rather than a
+live singing session in this particular verification pass - deliberately,
+not as a shortcut: their correctness lives in exact frame-by-frame/
+millisecond-boundary behavior (does a change get honored one frame too
+early? does a one-frame dropout wrongly release a note? does the log
+curve actually read meaningfully higher than linear at ordinary levels?)
+that a host test can assert on deterministically and a live mic session
+cannot. The hardware run confirms the *integration* - it boots,
+initializes the MIDI queue, and runs the whole pipeline with zero
+regressions - which is what hardware verification can actually add on
+top of the host tests here.
 
 Two other real bring-up findings worth knowing about, both already fixed
 and documented in `docs/hardware.md`/`docs/tuning.md`: the LCD initially
@@ -191,7 +198,7 @@ front-end.
 | 3 | Fundamental frequency detection (YIN) | Done |
 | 4 | Frequency -> MIDI note conversion | Done, host-tested + verified on hardware |
 | 5 | MIDI Note On/Off generation | Done, host-tested + verified on hardware |
-| 6 | Vocal dynamics -> MIDI velocity | Partially done (velocity mapping; see docs/midi.md) |
+| 6 | Vocal dynamics -> MIDI velocity | Done, host-tested + verified on hardware |
 | 7 | Continuous CC11 Expression | Planned |
 | 8 | BLE MIDI | Planned |
 | 9 | DIN MIDI over UART (optional) | Planned |

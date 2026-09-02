@@ -5,9 +5,12 @@
  * Current milestones implemented: 1 (continuous microphone acquisition +
  * basic signal display), 2 (RMS/envelope + voice activity detection),
  * 3 (YIN fundamental frequency detection - see components/pitch),
- * 4 (frequency -> MIDI note conversion - see components/voice_midi), and
+ * 4 (frequency -> MIDI note conversion - see components/voice_midi),
  * 5 (note-stabilization state machine + MIDI Note On/Off generation -
- * see components/voice_midi/note_state_machine.c and components/midi).
+ * see components/voice_midi/note_state_machine.c and components/midi),
+ * and 6 (vocal dynamics -> MIDI velocity - yp_level_to_velocity() in
+ * components/voice_midi/voice_midi.c, called from the state machine at
+ * Note On/Change time).
  * See docs/architecture.md for the full roadmap and README.md for status.
  *
  * Task layout (see docs/architecture.md "FreeRTOS architecture" for the

@@ -106,30 +106,61 @@ for:
   until pitch has been unreliable for this many *consecutive* frames, so
   a single dropped/low-confidence frame mid-note doesn't cut it off.
 
-248 host-test checks in `test/test_note_state_machine.c` exercise all of
+239 host-test checks in `test/test_note_state_machine.c` exercise all of
 the above, including the exact spec wording this state machine exists to
 satisfy: "a small pitch fluctuation must not generate Note Off/On/Off/On
 continuously."
 
-## Dynamics -> velocity (Milestone 6, partially implemented) / CC11 (Milestone 7, not yet implemented)
+## Dynamics -> velocity (Milestone 6, implemented)
 
 `yp_level_to_velocity()` (`voice_midi.c`) maps the envelope-followed
-level to a MIDI velocity using `YP_DEFAULT_VELOCITY_CURVE` (linear or
-logarithmic - log by default: it maps in the dB domain, so quiet-to-
-medium level changes get proportionally more of the velocity range,
-tracking perceived loudness better than a raw linear mapping). This
-exists now, ahead of Milestone 6 in the roadmap, because Milestone 5
-cannot emit a valid Note On without *some* velocity - see
-`components/voice_midi/include/voice_midi.h`'s comment on why. What
-Milestone 6 still adds: reconsidering whether attack-time velocity should
-differ from continued in-note dynamics tracking (right now the same
-function is used for both a note's initial velocity and, if a note
-changes, its new velocity - there is no separate mechanism yet for
-*continued* dynamics within one held note). CC11 Expression streaming
-while a note is held (`YP_CC11_ENABLED`, rate-limited by
-`YP_CC11_MIN_DELTA`/`YP_CC11_MIN_INTERVAL_MS`) is Milestone 7 and not
-started - `midi_send_cc()` exists in `components/midi/midi.h` (per the
-spec's transport-independent engine design) but nothing calls it yet.
+level - the vocal *attack* level, per the spec's own wording - to a MIDI
+velocity using `YP_DEFAULT_VELOCITY_CURVE`:
+
+- **linear**: velocity proportional to level, clamped between
+  `YP_DYNAMICS_NOISE_FLOOR` (-> `YP_MIDI_VELOCITY_MIN`) and
+  `YP_DYNAMICS_MAX_RMS` (-> `YP_MIDI_VELOCITY_MAX`).
+- **log (default)**: the same clamping, but the mapping is linear in dB
+  (`20*log10(level)`) rather than in level itself - quiet-to-medium level
+  changes get proportionally more of the velocity range, tracking
+  perceived loudness better than a raw linear mapping. Concretely (see
+  `test/test_dynamics.c`'s `test_log_curve_differs_meaningfully_from_linear`):
+  at a moderate level, the log curve reads more than 20 velocity units
+  higher than linear - a real, measured demonstration of the spec's own
+  warning against "a simple raw linear mapping" producing "poor musical
+  behaviour" (with linear, ordinary singing volume would cluster into a
+  narrow low-velocity band, leaving most of the 1-127 range for levels a
+  singer will rarely reach).
+
+The log curve's shape lands close to the spec's own example mapping
+(soft voice ~20, normal ~70, strong ~120) at plausible operating points -
+verified in `test_matches_spec_reference_mapping` with a deliberately
+generous tolerance, since the spec gives these as illustrative points,
+not exact RMS-to-velocity gospel.
+
+Velocity is computed once, at the exact hop a Note On or Note Change
+commits (`note_state_machine.c` calls `yp_level_to_velocity()` there),
+using that hop's envelope level - by the time
+`YP_NOTE_MIN_STABLE_FRAMES` (24 ms at the default hop size) has elapsed
+since a candidate pitch first appeared, the envelope follower's fast
+attack time constant (`YP_ENVELOPE_ATTACK_MS` = 8 ms) has already caught
+up to the true attack level, so a separate peak-tracking mechanism isn't
+needed for this to reflect the actual attack, not a stale/ramping value -
+`test_note_on_carries_velocity_from_the_triggering_frame` checks a softer
+vs. louder attack produce correspondingly different velocities.
+
+Explicitly **not** what this milestone covers, and not a gap in it:
+tracking dynamics *after* note onset, while a note is held. That is
+Milestone 7's job.
+
+## CC11 Expression (Milestone 7, not yet implemented)
+
+Would stream continued vocal-intensity changes while a note is held as
+MIDI CC11 (`YP_CC11_ENABLED`, rate-limited by `YP_CC11_MIN_DELTA`/
+`YP_CC11_MIN_INTERVAL_MS` so a continuously-varying voice does not flood
+the MIDI connection). `midi_send_cc()` already exists in
+`components/midi/midi.h` (per the spec's transport-independent engine
+design, built once in Milestone 5) but nothing calls it yet.
 
 ## Pitch bend (Milestone 10, optional)
 

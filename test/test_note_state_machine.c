@@ -209,33 +209,26 @@ static void test_low_confidence_never_triggers(void)
     TEST_CHECK_TRUE(sm.state == YP_NOTE_STATE_SILENCE, "should remain in SILENCE indefinitely");
 }
 
-static void test_velocity_mapping_bounds_and_monotonicity(void)
+/* Dynamics -> velocity mapping (yp_level_to_velocity) gets its own
+ * dedicated suite - see test_dynamics.c - since it is Milestone 6's own
+ * deliverable, not just a detail of note-on triggering. */
+
+static void test_note_on_carries_velocity_from_the_triggering_frame(void)
 {
-    TEST_CASE("yp_level_to_velocity: bounds, clamping and monotonicity for both curves");
+    TEST_CASE("Note On's velocity reflects the level of the hop that triggered it, not a stale/default value");
+    yp_note_sm_t sm;
+    yp_note_sm_init(&sm);
+    int64_t clock = 0;
 
-    yp_vel_curve_t curves[2] = { YP_VEL_CURVE_LINEAR, YP_VEL_CURVE_LOG };
-    for (int c = 0; c < 2; c++) {
-        int at_floor = yp_level_to_velocity(0.0f, curves[c]);
-        int at_or_below_floor = yp_level_to_velocity(YP_DYNAMICS_NOISE_FLOOR, curves[c]);
-        int at_max = yp_level_to_velocity(YP_DYNAMICS_MAX_RMS, curves[c]);
-        int above_max = yp_level_to_velocity(YP_DYNAMICS_MAX_RMS * 10.0f, curves[c]);
+    yp_note_event_t soft = drive(&sm, reliable(440.0f, 0.9f, 0.02f), YP_NOTE_MIN_STABLE_FRAMES, &clock);
+    int soft_vel = soft.velocity;
 
-        TEST_CHECK_EQ_INT(at_floor, YP_MIDI_VELOCITY_MIN, "at/below noise floor -> minimum velocity");
-        TEST_CHECK_EQ_INT(at_or_below_floor, YP_MIDI_VELOCITY_MIN, "exactly at noise floor -> minimum velocity");
-        TEST_CHECK_EQ_INT(at_max, YP_MIDI_VELOCITY_MAX, "at configured max RMS -> maximum velocity");
-        TEST_CHECK_EQ_INT(above_max, YP_MIDI_VELOCITY_MAX, "above max RMS clamps to maximum velocity, does not overflow");
+    yp_note_sm_init(&sm);
+    clock = 0;
+    yp_note_event_t loud = drive(&sm, reliable(440.0f, 0.9f, 0.45f), YP_NOTE_MIN_STABLE_FRAMES, &clock);
+    int loud_vel = loud.velocity;
 
-        int prev = YP_MIDI_VELOCITY_MIN;
-        bool monotonic = true;
-        for (int i = 1; i <= 20; i++) {
-            float level = YP_DYNAMICS_NOISE_FLOOR
-                          + (YP_DYNAMICS_MAX_RMS - YP_DYNAMICS_NOISE_FLOOR) * ((float)i / 20.0f);
-            int v = yp_level_to_velocity(level, curves[c]);
-            if (v < prev) monotonic = false;
-            prev = v;
-        }
-        TEST_CHECK_TRUE(monotonic, "velocity must never decrease as level increases");
-    }
+    TEST_CHECK_TRUE(loud_vel > soft_vel, "a louder attack must produce a higher velocity than a soft one");
 }
 
 int main(void)
@@ -249,6 +242,6 @@ int main(void)
     test_release_after_sustained_silence();
     test_brief_dropout_does_not_release();
     test_low_confidence_never_triggers();
-    test_velocity_mapping_bounds_and_monotonicity();
+    test_note_on_carries_velocity_from_the_triggering_frame();
     return TEST_MAIN_END();
 }
