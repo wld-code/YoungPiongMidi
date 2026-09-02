@@ -478,8 +478,25 @@ class SynthStudioApp:
     def _toggle_sequencer(self):
         if self.seq_player.playing:
             self.seq_player.stop()
-            self.seq_play_btn.configure(text="▶ Play")
+            self.seq_play_btn.configure(text="▶ Play pattern")
         else:
+            self.seq_player.start()
+            self.seq_play_btn.configure(text="■ Stop")
+
+    def _ensure_pattern_playing(self):
+        """Starts the step sequencer if it isn't already running - Record
+        and Play take both call this first, so pressing either actually
+        has something being generated to capture/loop instead of
+        silently capturing silence because the pattern was never
+        started separately. Never stops it - Record/Play take finishing
+        doesn't interrupt a groove the user may still want running;
+        that's still Play pattern/Stop's own job. Since SequencerPlayer
+        already re-reads the active bank's steps every single step (see
+        sequencer.py), a running pattern automatically follows the same
+        bank switches LiveRecordSession is already following while
+        armed - no extra sync code needed for that part, they're both
+        already reading the one shared self.seq_model.active_bank."""
+        if not self.seq_player.playing:
             self.seq_player.start()
             self.seq_play_btn.configure(text="■ Stop")
 
@@ -576,6 +593,7 @@ class SynthStudioApp:
                 self.takes[bank] = take
             self._update_record_status_label()
         else:
+            self._ensure_pattern_playing()
             self.live_record.arm()
             self.record_btn.configure(text="■ Stop Rec", bg="#ff5f5f", fg="#04121f")
             self.record_status_var.set(f"Bank {self.live_record.current_bank + 1}: recording...")
@@ -586,6 +604,7 @@ class SynthStudioApp:
             self.take_player.stop()
             self.take_play_btn.configure(text="▶ Play take", bg=PANEL_BG, fg=FG)
         elif take is not None and not take.is_empty():
+            self._ensure_pattern_playing()
             self.take_player.play(take, loop=True)  # loops automatically until Stop
             self.take_play_btn.configure(text="■ Stop take", bg=ACCENT, fg="#04121f")
 
@@ -875,8 +894,13 @@ class SynthStudioApp:
             self.seq_model.toggle_step(0, step_index, note)
         self.seq_model.toggle_accent(0, 8)
         self.seq_bpm_var.set(180)
-        self._toggle_sequencer()   # start pattern playback (bank 1's pattern)
+        # Deliberately NOT calling _toggle_sequencer() here - Record
+        # itself must start the pattern automatically (see
+        # _ensure_pattern_playing()); this is what actually verifies
+        # that wiring rather than masking it by pre-starting playback.
+        assert not self.seq_player.playing
         self._toggle_recording()   # arm MIDI take recording - defaults to bank 1
+        assert self.seq_player.playing, "Record must auto-start the sequencer pattern"
 
         switch1_ms = int(total_seconds * 1000 * 0.30)
         go_silent_ms = int(total_seconds * 1000 * 0.55)

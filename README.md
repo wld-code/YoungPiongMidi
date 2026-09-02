@@ -277,13 +277,20 @@ python3 tools/synth_studio.py
   restart Record for each one. A bank's existing take is only ever
   replaced once a switch (or Stop) finalizes a segment that actually
   captured a note - just landing on, or re-arming over, a bank that
-  already has one never erases it. **Play take** loops that bank's
-  captured performance at its original timing, repeating automatically
-  until Stop; **💾 Save** exports it as a standard `.mid` file under
-  `tools/recordings/` (gitignored) - a real, DAW-importable MIDI
-  recording, not audio. This is a genuinely different thing from the
-  step sequencer above (a fixed 16-step grid you program by hand) -
-  it's a live take of an actual performance, the same idea as a
+  already has one never erases it. **Record and Play take both
+  automatically start the step sequencer's pattern playback if it isn't
+  already running** (and never stop it - Play pattern/Stop still owns
+  that), so pressing either one always has something actually looping
+  to capture or accompany instead of silently recording nothing; since
+  a running pattern already re-reads the active bank on every step, it
+  stays in sync with recording's own bank-following for free. **Play
+  take** loops that bank's captured performance at its original timing,
+  repeating automatically until Stop; **💾 Save** exports it as a
+  standard `.mid` file under `tools/recordings/` (gitignored) - a real,
+  DAW-importable MIDI recording, not audio. This is a genuinely
+  different thing from the step sequencer above (a fixed 16-step grid
+  you program by hand) - it's a live take of an actual performance, the
+  same idea as a
   hardware loop pedal or a DAW's Session View.
 - **Live waveform**, a VU-style level meter, and a scrolling piano-roll
   of the actual melody being generated - not a mockup, driven by the
