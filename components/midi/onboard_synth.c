@@ -15,6 +15,20 @@
  * The handful of shared scalars between them are guarded by a spinlock
  * (portMUX) rather than a full mutex - each critical section is a few
  * integer reads/writes, well within what a spinlock is for.
+ *
+ * Latency, measured not assumed: the first version of this file used
+ * I2S_CHANNEL_DEFAULT_CONFIG()'s stock DMA sizing (dma_desc_num=6 x
+ * dma_frame_num=240 = 1440 frames = 90ms at 16kHz) without overriding
+ * it. i2s_channel_write() happily fills that whole pipeline with
+ * already-rendered audio before it ever blocks waiting for playback, so
+ * once primed, there is a *steady-state* ~90ms gap between "a MIDI event
+ * updates the shared state" and "that state's effect is actually heard"
+ * - state changes land instantly (the spinlock-guarded assignment
+ * doesn't care what synth_task is doing), but the audio already queued
+ * ahead of it has to drain first. Reported by the user as audibly
+ * out of sync with the console's MIDI log. Fixed by explicitly sizing
+ * dma_desc_num/dma_frame_num to a small multiple of SYNTH_BLOCK_SAMPLES
+ * instead of accepting the default - see DMA_TOTAL_FRAMES below.
  */
 #include <stdbool.h>
 #include <string.h>
@@ -32,7 +46,9 @@
 static const char *TAG = "onboard_synth";
 
 #define SYNTH_SAMPLE_RATE_HZ   16000
-#define SYNTH_BLOCK_SAMPLES    128
+#define SYNTH_BLOCK_SAMPLES    64     /* 4ms/block: bounds how stale a
+                                          state snapshot can be before
+                                          it's rendered - see below */
 #define OSC_AMPLITUDE          16000  /* leaves headroom under int16 full scale */
 
 #define SYNTH_TASK_STACK_BYTES 3072
@@ -41,6 +57,16 @@ static const char *TAG = "onboard_synth";
                                        a way a delayed log line doesn't -
                                        but still well below the audio
                                        capture/DSP path (11-12) */
+
+/* DMA sizing: total in-flight audio = DMA_DESC_NUM * SYNTH_BLOCK_SAMPLES
+ * frames. 3 buffers of one block each gives triple-buffering (room for
+ * synth_task to be briefly preempted by the higher-priority audio/DSP
+ * path - up to ~13ms on the YIN-heavy 1-in-3 hops, see docs/tuning.md -
+ * without an audible underrun/click) while keeping steady-state latency
+ * to 3*4ms = 12ms, not the stock config's 90ms. Tune DMA_DESC_NUM up if
+ * you hear clicks, down if you want to shave latency further and don't. */
+#define DMA_DESC_NUM   3
+#define DMA_TOTAL_MS   (1000.0f * DMA_DESC_NUM * SYNTH_BLOCK_SAMPLES / SYNTH_SAMPLE_RATE_HZ)
 
 /* Q15 amplitude envelope step sizes, precomputed from the desired
  * attack/release times at this sample rate. */
@@ -158,6 +184,10 @@ esp_err_t onboard_synth_init(void)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
+    /* Override the default 6x240=1440-frame (90ms) DMA sizing - see the
+     * latency comment at the top of this file. */
+    chan_cfg.dma_desc_num = DMA_DESC_NUM;
+    chan_cfg.dma_frame_num = SYNTH_BLOCK_SAMPLES;
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx_handle, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(err));
@@ -207,6 +237,7 @@ esp_err_t onboard_synth_init(void)
     }
 
     s_ready = true;
-    ESP_LOGI(TAG, "ready: %d Hz square/PWM voice on the board speaker", SYNTH_SAMPLE_RATE_HZ);
+    ESP_LOGI(TAG, "ready: %d Hz square/PWM voice on the board speaker, DMA latency budget ~%.0fms",
+             SYNTH_SAMPLE_RATE_HZ, (double)DMA_TOTAL_MS);
     return ESP_OK;
 }

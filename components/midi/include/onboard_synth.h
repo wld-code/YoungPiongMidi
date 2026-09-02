@@ -49,10 +49,15 @@ esp_err_t onboard_synth_init(void);
 /**
  * @brief Render one MIDI event to the synth voice.
  *
- * Safe to call from any task (guarded internally); intended to be
- * called from midi_task's dispatch, once per dequeued event, so the
- * board's own speaker mirrors exactly what midi_task's log line
- * reports.
+ * Safe to call from any task (guarded internally by a spinlock - see
+ * onboard_synth.c). Called synchronously from midi.c's midi_send_*()
+ * functions (in the caller's own task, e.g. dsp_task), NOT from
+ * midi_task's queued dispatch like log_event() and future BLE/UART
+ * sends - a real latency bug (audio audibly behind the console's MIDI
+ * log) was traced to that extra queue+task-switch hop being on the
+ * audio path for no benefit (a spinlock-guarded assignment cannot
+ * usefully be "queued" the way a possibly-blocking transport send can).
+ * See midi.c's enqueue() for the full reasoning.
  */
 void onboard_synth_handle_event(const midi_event_t *event);
 

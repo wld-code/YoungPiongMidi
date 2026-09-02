@@ -61,10 +61,9 @@ whichever transport(s) are enabled (`YP_MIDI_BLE_ENABLED`,
 - **onboard_synth** (not a spec milestone - a bring-up/verification
   aid): a tiny monophonic square/PWM voice - fixed-point phase
   accumulator oscillator, Q15 linear amplitude envelope, CC11 Expression
-  modulating pulse width (10%..90% duty) - driven directly by the same
-  events `midi_task` dispatches, played over the board's existing PDM
-  speaker output (the same PA_CTL/PDM_P/PDM_N path as the boot
-  self-test's melody in `main/self_test.c`, initialized after that
+  modulating pulse width (10%..90% duty) - played over the board's
+  existing PDM speaker output (the same PA_CTL/PDM_P/PDM_N path as the
+  boot self-test's melody in `main/self_test.c`, initialized after that
   temporary use tears down its I2S channel). Deliberately no resonant
   filter: `tools/acid_synth_monitor.py`'s Python prototype of exactly
   that went numerically unstable under rapid note changes even with
@@ -78,6 +77,15 @@ whichever transport(s) are enabled (`YP_MIDI_BLE_ENABLED`,
   synth's own note re-triggering a new detection) - not something
   software here dampens; if it happens, it happens at real, audible
   volume, not silently.
+
+  Driven *synchronously* from `midi_send_*()` (in `midi.c`'s
+  `enqueue()`), not from `midi_task`'s queued dispatch the way
+  `log_event()` and future BLE/UART sends are - and its I2S DMA sizing is
+  explicitly overridden to a ~12ms budget rather than the driver's
+  ~90ms-implying default. Both were real, measured, user-reported
+  latency bugs, not design choices made up front - see docs/tuning.md
+  ("Onboard synth: audio audibly lagged the MIDI log by ~90ms") for the
+  full story and the numbers behind them.
 - **BLE MIDI** (Milestone 8, default/primary, not yet implemented):
   advertises as `YP_BLE_DEVICE_NAME` ("YoungPiongMidi"). Own ESP-IDF
   component (`midi_ble.c`), so NimBLE/Bluedroid specifics never leak into

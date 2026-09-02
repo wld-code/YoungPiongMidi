@@ -38,22 +38,20 @@ static void log_event(const midi_event_t *ev)
     }
 }
 
-/* Dispatch one dequeued event to every enabled transport. With both
- * YP_MIDI_BLE_ENABLED and YP_MIDI_UART_ENABLED at 0 (current default -
- * see yp_config.h), the #if below compiles away to nothing but
- * log_event()/onboard_synth_handle_event(); flipping either flag once
- * its transport component exists (Milestones 8/9) adds a real send call
- * here without anything upstream changing.
+/* Dispatch one dequeued event to every enabled *queued* transport. With
+ * both YP_MIDI_BLE_ENABLED and YP_MIDI_UART_ENABLED at 0 (current
+ * default - see yp_config.h), the #if below compiles away to nothing
+ * but log_event(); flipping either flag once its transport component
+ * exists (Milestones 8/9) adds a real send call here without anything
+ * upstream changing.
  *
- * onboard_synth is not one of the spec's BLE/UART transports - it's a
- * "hear it on the board itself, no laptop needed" path, self-contained
- * and always on (onboard_synth_handle_event() no-ops safely if the
- * synth failed to init, so this is never a reason for a dequeued event
- * to be lost). */
+ * onboard_synth is deliberately NOT called from here - see enqueue()
+ * below for why it's driven synchronously, straight from the
+ * midi_send_*() call, instead of waiting for midi_task to dequeue this
+ * event like every other consumer does. */
 static void dispatch_event(const midi_event_t *ev)
 {
     log_event(ev);
-    onboard_synth_handle_event(ev);
 
 #if YP_MIDI_BLE_ENABLED
 #error "YP_MIDI_BLE_ENABLED is set but midi_ble.c does not exist yet (Milestone 8)"
@@ -100,6 +98,28 @@ static esp_err_t enqueue(midi_event_type_t type, uint8_t channel, uint8_t data1,
         .data2 = data2,
         .timestamp_us = esp_timer_get_time(),
     };
+
+    /* Rendered synchronously, right here in the caller's own task
+     * (dsp_task), NOT via the queue + midi_task dequeue that log_event()
+     * and future BLE/UART sends go through. Two reasons that split is
+     * deliberate rather than an inconsistency:
+     *   1. Latency: the queue send only *guarantees* delivery, it does
+     *      not bound *when* midi_task gets scheduled to act on it -
+     *      dsp_task (priority 11) can keep running past this call for
+     *      the rest of its current hop before midi_task (priority 6)
+     *      ever gets the CPU. onboard_synth_handle_event() only ever
+     *      does a few-instruction spinlock-guarded assignment - it does
+     *      not need, and should not pay for, that hand-off. This was a
+     *      real, reported symptom (audio audibly behind the console's
+     *      MIDI log) before this call was moved here - see
+     *      onboard_synth.c's own latency comment for the DMA-buffering
+     *      half of that same fix.
+     *   2. Safety: unlike a real transport, this can never legitimately
+     *      block or fail in a way that should drop the event - it is
+     *      not "queued", it just updates in place - so it does not need
+     *      the queue's overflow-drop protection either. */
+    onboard_synth_handle_event(&ev);
+
     if (xQueueSend(s_queue, &ev, 0) != pdTRUE) {
         ESP_LOGW(TAG, "queue full, dropped a MIDI event (type=%d)", type);
         return ESP_ERR_NO_MEM;

@@ -3,6 +3,62 @@
 Live findings from real-hardware bring-up, kept here instead of only in
 commit messages so they survive.
 
+## Onboard synth: audio audibly lagged the MIDI log by ~90ms
+
+**What the user reported**: after `components/midi/onboard_synth.c`
+first landed, sound did come out of the board's speaker, but noticeably
+behind the `midi: NOTE_ON`/`CC`/`NOTE_OFF` lines on the console - not
+"real-time," not synced.
+
+**Two independent causes, both fixed, both measured**:
+
+1. **I2S DMA buffering depth**. `onboard_synth_init()` used
+   `I2S_CHANNEL_DEFAULT_CONFIG()` without overriding its DMA sizing:
+   `dma_desc_num=6` x `dma_frame_num=240` = 1440 frames = **90ms** of
+   audio buffered at 16 kHz, confirmed by reading
+   `components/esp_driver_i2s/include/driver/i2s_common.h`'s macro
+   directly rather than assumed. `i2s_channel_write()` happily fills
+   that whole pipeline with already-rendered audio before it ever blocks
+   on playback, so once primed there is a steady-state ~90ms gap between
+   a state change landing and it being heard - the state itself updates
+   instantly (a spinlock-guarded assignment doesn't care what the render
+   task is doing), but ~90ms of already-queued audio has to drain first.
+   Fixed by explicitly sizing `dma_desc_num=3` x
+   `dma_frame_num=SYNTH_BLOCK_SAMPLES(64)` = 192 frames = **12ms**
+   (triple-buffered - enough headroom for synth_task to survive being
+   briefly preempted by the higher-priority audio/DSP path, currently up
+   to ~13ms on the YIN-heavy 1-in-3 hops, without an audible underrun).
+   `onboard_synth_init()` now logs the actual computed budget
+   (`DMA latency budget ~12ms`) so this is never silently wrong again.
+2. **An unnecessary task hop**. `onboard_synth_handle_event()` was
+   originally called from `midi_task`'s queued dispatch - the same path
+   `log_event()` uses. But `dsp_task` (priority 11) enqueuing an event
+   does not bound *when* `midi_task` (priority 6) gets scheduled to act
+   on it; `dsp_task` can keep running for the rest of its current hop
+   first. A queue exists to protect against a transport that might block
+   (a real BLE/UART send) - it buys nothing for a same-task,
+   never-blocking spinlock update, and was pure added latency on the one
+   path that's actually latency-sensitive. Fixed by calling
+   `onboard_synth_handle_event()` synchronously from `midi.c`'s
+   `enqueue()` (i.e. inside `midi_send_note_on()` etc., in the caller's
+   own task), *in addition to* still enqueueing for `log_event()` and
+   future transports.
+
+**Verified on hardware after both fixes**: `onboard_synth: ready: ...
+DMA latency budget ~12ms` at boot, and DSP timing unchanged (~4.7ms
+avg/13ms worst-case per hop, same as every prior measurement) - the
+synchronous `onboard_synth_handle_event()` call adds a spinlock and, on
+Note On only, one `powf()`-based frequency calculation to `dsp_task`'s
+hot path, both negligible next to the budget already measured there.
+
+**Takeaway**: "the RTOS should be real-time" is not something a task
+priority table alone guarantees - a decoupling queue that's the right
+call for one consumer (a transport that might block) can be exactly the
+wrong call for another (a spinlock update that never does), and a
+driver's *default* buffer sizing is tuned for glitch-free playback in
+general, not for the latency budget any particular application actually
+needs. Both were measurable, not assumed, once looked for.
+
 ## Pitch: ESP32-C5 has no hardware FPU - float YIN measured ~79ms/hop
 
 **Symptom observed on hardware**: after wiring up YIN (Milestone 3), the
