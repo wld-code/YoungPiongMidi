@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-synth_studio.py - YoungPiongMidi Synth Studio: a real-time Python GUI
+synth_studio.py - Young Piong Synth Studio: a real-time Python GUI
 synthesizer that connects to the board over the same serial MIDI log
 tools/acid_synth_monitor.py reads (see docs/midi.md - BLE/UART wire
 transports are Milestones 8-9, so this log is still the only "transport"
 that exists), plays it through a 10-instrument polyphonic synth engine
 (synth_instruments.py), and shows the incoming audio waveform, MIDI
 event log, and a scrolling piano-roll of the melody the board generates
-- all live.
+- all live. Also includes a built-in 8-bank x 16-step sequencer
+(sequencer.py) and a WAV recorder (recorder.py) for programming and
+capturing your own patterns independent of the board.
 
 Quick start:
     pip install pyserial numpy sounddevice
@@ -19,16 +21,23 @@ play a fixed riff with no hardware attached.)
 Architecture (why threads are split this way):
     - serial-reader thread (midi_link.serial_reader_thread): parses the
       board's log, calls straight into SynthEngine.note_on/note_off/cc.
-    - sounddevice audio callback thread: calls SynthEngine.render() and
-      also feeds a small lock-protected ring buffer the waveform view
-      reads from - kept separate from the Tk main thread since Tkinter
-      is not thread-safe and audio callbacks must never block on GUI work.
+    - sequencer-player thread (sequencer.SequencerPlayer): steps through
+      the active bank at the configured tempo, also calling straight
+      into SynthEngine.note_on/note_off - from the engine's point of
+      view a sequencer step and a board note are indistinguishable, so
+      both show up in the same waveform/log/piano-roll for free.
+    - sounddevice audio callback thread: calls SynthEngine.render(),
+      feeds a small lock-protected ring buffer the waveform view reads
+      from, and (while recording) hands the block to AudioRecorder -
+      kept separate from the Tk main thread since Tkinter is not
+      thread-safe and audio callbacks must never block on GUI work.
     - Tk main thread: runs the event loop and a periodic (~30 Hz) timer
       that pulls cheap snapshots (SynthEngine.snapshot_for_ui(), the
-      waveform ring buffer) and redraws - it never touches engine/voice
-      internals directly.
+      waveform ring buffer, SequencerPlayer.current_step) and redraws -
+      it never touches engine/voice/player internals directly.
 """
 import argparse
+import os
 import sys
 import threading
 import time
@@ -38,6 +47,9 @@ import numpy as np
 
 from midi_link import find_default_port, note_label, serial_reader_thread
 from synth_instruments import SynthEngine, INSTRUMENTS
+from sequencer import (SequencerModel, SequencerPlayer, step_duration_seconds,
+                        NUM_BANKS, NUM_STEPS, MIN_BPM, MAX_BPM, DEFAULT_BPM)
+from recorder import AudioRecorder
 
 try:
     import tkinter as tk
@@ -51,6 +63,7 @@ except ImportError:
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 256
 UI_FPS = 30
+RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 
 INSTRUMENT_COLORS = [
     "#ff5f5f", "#ff9f4a", "#f4d03f", "#7ed957", "#3fd9c0",
@@ -127,6 +140,17 @@ class SynthStudioApp:
         self.demo_running = False
         self._tick_count = 0
 
+        self.seq_model = SequencerModel()
+        self.seq_player = SequencerPlayer(self.seq_model, self.engine.note_on, self.engine.note_off,
+                                           on_step=self._on_seq_step)
+        self._seq_playhead = -1  # written from the player thread, read from the Tk thread each
+                                  # tick - a single int assignment, same reasoning as elsewhere
+                                  # in this file for why that's safe without a lock
+
+        self.recorder = AudioRecorder(SAMPLE_RATE)
+        self.recording_started_at = None
+        self.last_recording_path = None
+
         self._build_ui()
         self._start_audio(device)
 
@@ -140,18 +164,19 @@ class SynthStudioApp:
 
         if auto_close_after is not None:
             self.start_demo()
+            self._run_smoke_test_sequence()
             self.root.after(int(auto_close_after * 1000), self._smoke_test_finish)
 
     # --- UI construction -------------------------------------------------
     def _build_ui(self):
-        self.root.title("YoungPiongMidi — Synth Studio")
+        self.root.title("Young Piong Synth Studio")
         self.root.configure(bg=BG)
-        self.root.geometry("980x720")
-        self.root.minsize(820, 620)
+        self.root.geometry("1040x980")
+        self.root.minsize(860, 760)
 
         header = tk.Frame(self.root, bg=BG)
         header.pack(fill="x", padx=16, pady=(14, 6))
-        tk.Label(header, text="YoungPiongMidi Synth Studio", bg=BG, fg=FG,
+        tk.Label(header, text="Young Piong Synth Studio", bg=BG, fg=FG,
                   font=("Helvetica", 18, "bold")).pack(side="left")
         status_col = tk.Frame(header, bg=BG)
         status_col.pack(side="right")
@@ -216,6 +241,8 @@ class SynthStudioApp:
         self.roll_canvas = tk.Canvas(roll_frame, bg="#05070b", highlightthickness=0)
         self.roll_canvas.pack(fill="both", expand=True, padx=10, pady=(2, 10))
 
+        self._build_sequencer_ui(self.root)
+
         # --- Log + controls ---
         bottom = tk.Frame(self.root, bg=BG)
         bottom.pack(fill="both", expand=False, padx=16, pady=(0, 14))
@@ -266,6 +293,92 @@ class SynthStudioApp:
 
         self.select_instrument(0)
 
+    def _build_sequencer_ui(self, parent):
+        seq_frame = tk.Frame(parent, bg=PANEL_BG)
+        seq_frame.pack(fill="x", padx=16, pady=6)
+
+        top_row = tk.Frame(seq_frame, bg=PANEL_BG)
+        top_row.pack(fill="x", padx=10, pady=(8, 4))
+        tk.Label(top_row, text="SEQUENCER", bg=PANEL_BG, fg=MUTED_FG,
+                  font=("Helvetica", 9, "bold")).pack(side="left")
+
+        record_col = tk.Frame(top_row, bg=PANEL_BG)
+        record_col.pack(side="right")
+        self.seq_record_btn = tk.Button(record_col, text="● Record", command=self._toggle_recording,
+                                         bg="#3a1620", fg="#ffb3c0", relief="flat",
+                                         font=("Helvetica", 10, "bold"), padx=10, pady=4)
+        self.seq_record_btn.pack(side="right")
+        self.seq_play_btn = tk.Button(record_col, text="▶ Play", command=self._toggle_sequencer,
+                                       bg=ACCENT, fg="#04121f", relief="flat",
+                                       font=("Helvetica", 10, "bold"), padx=10, pady=4)
+        self.seq_play_btn.pack(side="right", padx=(0, 8))
+        self.record_status_var = tk.StringVar(value="")
+        tk.Label(top_row, textvariable=self.record_status_var, bg=PANEL_BG, fg=MUTED_FG,
+                  font=("Helvetica", 9)).pack(side="right", padx=(0, 12))
+
+        # --- Tempo + note-to-place + clear ---
+        tempo_row = tk.Frame(seq_frame, bg=PANEL_BG)
+        tempo_row.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(tempo_row, text="Tempo", bg=PANEL_BG, fg=MUTED_FG, font=("Helvetica", 9)
+                  ).pack(side="left")
+        self.seq_bpm_var = tk.IntVar(value=DEFAULT_BPM)
+        tk.Scale(tempo_row, from_=MIN_BPM, to=MAX_BPM, orient="horizontal", length=180,
+                 variable=self.seq_bpm_var, command=self._on_bpm_changed, bg=PANEL_BG, fg=FG,
+                 troughcolor="#0e1016", highlightthickness=0, relief="flat",
+                 activebackground=ACCENT).pack(side="left", padx=(6, 4))
+        self.seq_bpm_label_var = tk.StringVar(value=f"{DEFAULT_BPM} BPM")
+        tk.Label(tempo_row, textvariable=self.seq_bpm_label_var, bg=PANEL_BG, fg=FG,
+                  font=("Helvetica", 9, "bold"), width=8).pack(side="left", padx=(0, 20))
+
+        tk.Label(tempo_row, text="Note to place", bg=PANEL_BG, fg=MUTED_FG, font=("Helvetica", 9)
+                  ).pack(side="left")
+        self.seq_note_var = tk.IntVar(value=60)
+        tk.Spinbox(tempo_row, from_=0, to=127, textvariable=self.seq_note_var, width=4,
+                   command=self._on_seq_note_changed, bg="#0e1016", fg=FG, buttonbackground=PANEL_BG,
+                   relief="flat", justify="center").pack(side="left", padx=(6, 4))
+        self.seq_note_label_var = tk.StringVar(value=note_label(60))
+        tk.Label(tempo_row, textvariable=self.seq_note_label_var, bg=PANEL_BG, fg=FG,
+                  font=("Helvetica", 9, "bold"), width=4).pack(side="left", padx=(0, 20))
+
+        tk.Button(tempo_row, text="Clear bank", command=self._on_clear_bank,
+                  bg=PANEL_BG, fg=FG, relief="flat", font=("Helvetica", 9)
+                  ).pack(side="left")
+        tk.Label(tempo_row, text="left-click: place/remove note · right-click: accent",
+                  bg=PANEL_BG, fg=MUTED_FG, font=("Helvetica", 8, "italic")
+                  ).pack(side="right")
+
+        # --- Bank selector ---
+        bank_row = tk.Frame(seq_frame, bg=PANEL_BG)
+        bank_row.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(bank_row, text="Bank", bg=PANEL_BG, fg=MUTED_FG, font=("Helvetica", 9)
+                  ).pack(side="left", padx=(0, 8))
+        self.seq_bank_buttons = []
+        for b in range(NUM_BANKS):
+            btn = tk.Button(bank_row, text=str(b + 1), width=3,
+                             command=lambda b=b: self._on_bank_select(b),
+                             bg=PANEL_BG, fg=FG, relief="flat", font=("Helvetica", 10, "bold"))
+            btn.pack(side="left", padx=2)
+            self.seq_bank_buttons.append(btn)
+
+        # --- Step grid ---
+        step_row = tk.Frame(seq_frame, bg=PANEL_BG)
+        step_row.pack(fill="x", padx=10, pady=(0, 10))
+        self.seq_step_buttons = []
+        for i in range(NUM_STEPS):
+            btn = tk.Button(step_row, text="", width=4, height=2,
+                             command=lambda i=i: self._on_step_click(i),
+                             bg="#232838", fg=MUTED_FG, relief="flat", font=("Helvetica", 9, "bold"),
+                             highlightthickness=2, highlightbackground=PANEL_BG)
+            # a small gap after every 4th step to visually group 16ths into beats
+            btn.grid(row=0, column=i, padx=(2, 10 if (i + 1) % 4 == 0 and i != NUM_STEPS - 1 else 2))
+            btn.bind("<Button-2>", lambda e, i=i: self._on_step_accent(i))
+            btn.bind("<Button-3>", lambda e, i=i: self._on_step_accent(i))
+            step_row.grid_columnconfigure(i, weight=1)
+            self.seq_step_buttons.append(btn)
+
+        self._redraw_seq_bank_buttons()
+        self._redraw_seq_steps()
+
     # --- Actions -----------------------------------------------------
     def select_instrument(self, inst_id):
         self.engine.set_instrument(inst_id)
@@ -313,6 +426,102 @@ class SynthStudioApp:
     def stop_demo(self):
         self.demo_running = False
         self.demo_btn.configure(text="▶ Start Demo")
+
+    # --- Sequencer -----------------------------------------------------
+    def _toggle_sequencer(self):
+        if self.seq_player.playing:
+            self.seq_player.stop()
+            self.seq_play_btn.configure(text="▶ Play")
+        else:
+            self.seq_player.start()
+            self.seq_play_btn.configure(text="■ Stop")
+
+    def _on_seq_step(self, step_index):
+        # Called from SequencerPlayer's own background thread - must
+        # never touch a Tk widget here. Just record the index; the ~30Hz
+        # _tick() redraw loop (Tk thread) picks it up and draws the
+        # playhead, same pattern as every other cross-thread value in
+        # this app (WaveformBuffer, SynthEngine.snapshot_for_ui()).
+        self._seq_playhead = step_index
+
+    def _on_bpm_changed(self, value):
+        try:
+            bpm = int(float(value))
+        except ValueError:
+            return
+        self.seq_model.set_bpm(bpm)
+        self.seq_bpm_label_var.set(f"{self.seq_model.bpm} BPM")
+
+    def _on_seq_note_changed(self):
+        try:
+            n = max(0, min(127, int(self.seq_note_var.get())))
+        except (ValueError, tk.TclError):
+            return
+        self.seq_note_label_var.set(note_label(n))
+
+    def _on_bank_select(self, bank_index):
+        self.seq_model.select_bank(bank_index)
+        self._redraw_seq_bank_buttons()
+        self._redraw_seq_steps()
+
+    def _on_step_click(self, step_index):
+        try:
+            n = max(0, min(127, int(self.seq_note_var.get())))
+        except (ValueError, tk.TclError):
+            n = 60
+        self.seq_model.toggle_step(self.seq_model.active_bank, step_index, n)
+        self._redraw_seq_steps()
+
+    def _on_step_accent(self, step_index):
+        self.seq_model.toggle_accent(self.seq_model.active_bank, step_index)
+        self._redraw_seq_steps()
+
+    def _on_clear_bank(self):
+        self.seq_model.clear_bank(self.seq_model.active_bank)
+        self._redraw_seq_steps()
+
+    def _redraw_seq_bank_buttons(self):
+        active = self.seq_model.active_bank
+        for i, btn in enumerate(self.seq_bank_buttons):
+            btn.configure(bg=ACCENT if i == active else PANEL_BG,
+                          fg="#04121f" if i == active else FG)
+
+    def _redraw_seq_steps(self):
+        steps = self.seq_model.active_steps()
+        playhead = self._seq_playhead if self.seq_player.playing else -1
+        inst_color = INSTRUMENT_COLORS[self.engine.current_instrument % len(INSTRUMENT_COLORS)]
+        for i, (btn, step) in enumerate(zip(self.seq_step_buttons, steps)):
+            if step.on:
+                bg = "#ffcf5c" if step.accent else inst_color
+                fg = "#04121f"
+                text = note_label(step.note)
+            else:
+                bg = "#232838"
+                fg = MUTED_FG
+                text = ""
+            btn.configure(text=text, bg=bg, fg=fg,
+                          highlightbackground="#ffffff" if i == playhead else PANEL_BG)
+
+    # --- Recording -----------------------------------------------------
+    def _toggle_recording(self):
+        if self.recorder.active:
+            audio = self.recorder.stop_and_get()
+            self.seq_record_btn.configure(text="● Record", bg="#3a1620", fg="#ffb3c0")
+            if len(audio) == 0:
+                self.record_status_var.set("nothing recorded (no audio was playing)")
+                return
+            os.makedirs(RECORDINGS_DIR, exist_ok=True)
+            filename = f"seq_{time.strftime('%Y%m%d_%H%M%S')}.wav"
+            path = os.path.join(RECORDINGS_DIR, filename)
+            self.recorder.save_wav(audio, path)
+            self.last_recording_path = path
+            seconds = len(audio) / SAMPLE_RATE
+            self.record_status_var.set(f"saved {filename} ({seconds:.1f}s)")
+        else:
+            self.recorder.start()
+            self.recording_started_at = time.time()
+            self.seq_record_btn.configure(text="■ Stop Rec", bg="#ff5f5f", fg="#04121f")
+            self.record_status_var.set("recording...")
 
     def reconnect(self):
         port = find_default_port()
@@ -399,6 +608,7 @@ class SynthStudioApp:
                 pass  # underruns can happen while the UI thread is busy; audible, not fatal
             block = self.engine.render(frames)
             self.waveform.write(block)
+            self.recorder.write(block)  # no-op when not recording (checked inside)
             outdata[:, 0] = block
 
         try:
@@ -421,6 +631,7 @@ class SynthStudioApp:
         self._draw_waveform()
         self._draw_meter()
         self._draw_piano_roll()
+        self._redraw_seq_steps()
         self._update_log(snap["events"])
         self.voices_var.set(f"voices: {snap['active_voices']}")
         self.expr_var.set(f"expression: {int(snap['expression'] * 100)}%")
@@ -430,6 +641,9 @@ class SynthStudioApp:
             self.held_var.set("Held: " + ", ".join(parts))
         else:
             self.held_var.set("Held: -")
+        if self.recorder.active and self.recording_started_at is not None:
+            elapsed = time.time() - self.recording_started_at
+            self.record_status_var.set(f"recording... {elapsed:0.1f}s")
         if not self.stop_event.is_set():
             self.root.after(int(1000 / UI_FPS), self._tick)
 
@@ -534,16 +748,41 @@ class SynthStudioApp:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    def _run_smoke_test_sequence(self):
+        """Exercises the sequencer + recorder end to end, not just the
+        demo riff - programs a small pattern on bank 2, selects it,
+        starts playback, and starts recording, all through the exact
+        same methods the GUI's own buttons call. Verified in
+        _smoke_test_finish() below."""
+        self.select_instrument(0)
+        self._on_bank_select(1)  # bank 2 (0-indexed)
+        for step_index, note in ((0, 48), (4, 55), (8, 60), (12, 63)):
+            self.seq_model.toggle_step(1, step_index, note)
+        self.seq_model.toggle_accent(1, 8)
+        self._on_bpm_changed(180)
+        self._toggle_sequencer()   # start playback
+        self._toggle_recording()   # start recording
+
     def _smoke_test_finish(self):
+        seq_was_playing = self.seq_player.playing
+        if self.recorder.active:
+            self._toggle_recording()  # stop + save, exactly like a user clicking the button
+        self.seq_player.stop(join=True)
+        recording_ok = (self.last_recording_path is not None
+                         and os.path.exists(self.last_recording_path)
+                         and os.path.getsize(self.last_recording_path) > 44)  # > just the WAV header
         print(f"[smoke-test] {self._tick_count} UI redraw ticks completed without exception, "
               f"active_voices last seen={self.engine.snapshot_for_ui()['active_voices']}, "
               f"connection_status={self.connection_status!r}, "
-              f"events_logged={len(self.engine.event_log)}")
+              f"events_logged={len(self.engine.event_log)}, "
+              f"sequencer_was_playing={seq_was_playing}, "
+              f"recording_saved={recording_ok} ({self.last_recording_path})")
         self._on_close()
 
     def _on_close(self):
         self.stop_event.set()
         self.demo_running = False
+        self.seq_player.stop()
         if getattr(self, "stream", None) is not None:
             try:
                 self.stream.stop()

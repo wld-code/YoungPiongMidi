@@ -42,7 +42,7 @@ instrument. It preserves two musical properties of the voice, not just
 | | |
 |---|---|
 | ✅ **Working, on real hardware, right now** | Mic → pitch → MIDI note → velocity → CC11 → sound, entirely on-device |
-| 🔊 **You can already hear it** | Board's own speaker, `tools/acid_synth_monitor.py`, or the full `tools/synth_studio.py` GUI |
+| 🔊 **You can already hear it** | Board's own speaker, `tools/acid_synth_monitor.py`, or the full Young Piong Synth Studio GUI (with a built-in sequencer) |
 | 🧪 **996 host-side test checks** | No board required - `cd test && make` |
 | 🚧 **Not yet implemented** | A wire MIDI transport (BLE/UART) and pitch bend - see [Roadmap](#-roadmap) |
 
@@ -128,8 +128,11 @@ docs/
                      principles, with diagrams
 test/               Host-side tests (real, passing - see test/README.md)
 tools/              acid_synth_monitor.py - real-time audio monitor
-                    synth_studio.py       - 10-instrument GUI synth + live
-                                             waveform/MIDI/melody view
+                    synth_studio.py       - Young Piong Synth Studio: 10-
+                                             instrument GUI synth + sequencer
+                                             + live waveform/MIDI/melody view
+                    sequencer.py          - 8-bank x 16-step sequencer model
+                    recorder.py           - WAV recorder
                     midi_link.py          - shared serial-MIDI-log parsing
 ```
 
@@ -222,25 +225,47 @@ see [`docs/tutorials/07-audio-synthesis-pdm.md`](docs/tutorials/07-audio-synthes
 for why, including a real numerical-instability bug found (and avoided
 on-device) while building the richer Python one.
 
-## 🎹 `tools/synth_studio.py` - full GUI synth studio
+## 🎹 Young Piong Synth Studio (`tools/synth_studio.py`)
 
 A real-time desktop app (Tkinter, no extra GUI framework needed) that
 turns the board's serial MIDI log into a proper playable instrument on
-the computer, with 10 selectable instruments and a live view of what the
-board is doing:
+the computer - 10 selectable instruments, a live view of what the board
+is doing, and a built-in 8-bank x 16-step sequencer with recording:
 
 ```sh
 pip install pyserial numpy sounddevice
 python3 tools/synth_studio.py
 ```
 
+![Young Piong Synth Studio layout preview](docs/img/synth_studio_preview.png)
+
+> [!NOTE]
+> The image above is a **to-scale layout preview**, not a live
+> screenshot - this environment cannot reliably capture the real Tk
+> window (its own display-session limitation, not a problem with the
+> app: the app runs, connects to the board, and produces real audio, all
+> verified below). It's generated straight from the app's own layout
+> constants/colors/structure, so it matches what actually renders.
+> Swapping in a real screenshot is a one-line change - see the alt text
+> in `README.md`'s source.
+
 - **10 instruments**, switchable live without interrupting a held note:
   Acid Bass (the same TB-303-style resonant voice as the monitor tool
   above), Sine Lead, Square Lead, Saw Pad, FM Bell, Pluck
   (Karplus-Strong string), Sub Bass, Brass, Organ, Vibraphone.
+- **An 8-bank x 16-step sequencer** (`tools/sequencer.py`): left-click a
+  step to place the currently-selected note, right-click to accent it,
+  pick which of the 8 banks is active, drag the tempo slider (40-240
+  BPM), and hit **Play**/**Stop**. Switching banks mid-playback takes
+  effect on the next step boundary, like a real hardware sequencer.
+  Sequencer notes go through the exact same engine call as a note from
+  the board, so they show up in the waveform/log/piano-roll for free.
+- **Record** captures whatever's actually coming out of the synth engine
+  (sequencer, board, or Demo mode - whatever's playing) to a WAV file
+  under `tools/recordings/` (gitignored), named by timestamp.
 - **Live waveform**, a VU-style level meter, and a scrolling piano-roll
-  of the actual melody the board is generating - not a mockup, driven by
-  the same NOTE_ON/NOTE_OFF/CC log line the onboard synth and
+  of the actual melody being generated - not a mockup, driven by the
+  same NOTE_ON/NOTE_OFF/CC log line the onboard synth and
   `acid_synth_monitor.py` read.
 - A scrolling **MIDI event log**, an **output-device picker** in the app
   itself (macOS can silently default audio to a disconnected Bluetooth
@@ -250,19 +275,31 @@ python3 tools/synth_studio.py
   trying the instruments before singing into the mic.
 
 > [!NOTE]
-> This is a GUI application - its window and layout can't be verified by
-> an automated coding agent that has no eyes on the screen. What *was*
-> verified: the underlying synth engine (`tools/synth_instruments.py`)
-> has its own headless test suite (`python3 tools/test_synth_engine.py`)
-> checking all 10 instruments for finite, non-silent, non-clipping
-> output under both normal use and an adversarial rapid-note-change/
-> voice-stealing stress test - which caught two real envelope bugs (FM
-> Bell and Pluck were silently producing zero output) before this was
-> ever handed over. The app itself was also smoke-tested end to end
-> (opened, connected to the real board's serial port, ran ~30 redraw
-> ticks/second with no exceptions, played the demo riff, closed cleanly)
-> - see the class docstrings in `tools/synth_studio.py` for exactly what
-> that does and doesn't prove.
+> This is a GUI application - its window and layout can't be visually
+> verified by an automated coding agent with no eyes on the screen
+> (that's also why the image above is a generated preview, not a
+> screenshot - see its own caption). What *was* verified, all before
+> this was ever handed over:
+> - **Engine correctness** (`python3 tools/test_synth_engine.py`,
+>   headless): all 10 instruments checked for finite/non-silent/
+>   non-clipping output, individually and under a full CC11 sweep, plus
+>   an adversarial rapid-note-change/voice-stealing stress test - caught
+>   two real envelope bugs (FM Bell and Pluck were silently producing
+>   zero output).
+> - **Sequencer correctness** (`python3 tools/test_sequencer.py`,
+>   headless): tempo math, step ordering/gating, accent velocity, bank
+>   switching mid-playback, and a real threading race caught and fixed
+>   (a fast Stop-then-Play could silently no-op, or - worse - leave an
+>   orphaned background thread still firing notes after a restart).
+> - **Recorder correctness** (`python3 tools/test_recorder.py`,
+>   headless): capture/concatenation, start/stop resets, and that the
+>   saved WAV is valid (right sample rate/format, actually contains the
+>   audio, clips rather than wraps out-of-range samples).
+> - **End-to-end integration**: `synth_studio.py --smoke-test N` opens
+>   the real window, connects to the real board over serial, programs a
+>   sequencer pattern, plays it, records it, and verifies a non-empty,
+>   non-silent WAV came out the other end - all through the exact same
+>   code path the UI buttons call.
 
 ## 📖 How to use it
 
