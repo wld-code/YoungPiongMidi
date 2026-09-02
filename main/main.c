@@ -29,6 +29,7 @@
 #include "audio_capture.h"
 #include "audio_dsp.h"
 #include "display.h"
+#include "self_test.h"
 
 static const char *TAG = "main";
 
@@ -166,6 +167,7 @@ void app_main(void)
 
     if (YP_LCD_ENABLED) {
         ESP_ERROR_CHECK(display_init());
+        self_test_run();
     }
 
     ESP_ERROR_CHECK(audio_dsp_init());
