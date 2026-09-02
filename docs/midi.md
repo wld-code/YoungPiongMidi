@@ -1,3 +1,5 @@
+[← Docs index](README.md) · New here? Read [tutorials 4-6](tutorials/) first for the concepts behind this document.
+
 # MIDI
 
 **Status: Milestone 5 implemented (note-stabilization state machine +

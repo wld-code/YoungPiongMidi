@@ -1,23 +1,25 @@
+[← Docs index](README.md)
+
 # Architecture
+
+> New to the concepts behind any of this (ADC/DMA, filters, YIN, MIDI,
+> state machines, FreeRTOS, PDM)? [`docs/tutorials/`](tutorials/) explains
+> each one from first principles before this document assumes you know
+> it. See [`docs/README.md`](README.md) for the full documentation map.
 
 ## Signal chain (target, end state)
 
-```
-Microphone
-    |
-ADC acquisition (continuous mode + DMA)
-    |
-Audio preprocessing (DC removal, HPF, LPF)
-    |
-Voice activity detection
-    |
-Pitch detection
-    |
-Amplitude / envelope detection
-    |
-MIDI note generation
-    |
-MIDI output (BLE, optionally DIN UART)
+```mermaid
+flowchart TD
+    MIC["Microphone"] --> ACQ["ADC acquisition\n(continuous mode + DMA)"]
+    ACQ --> PRE["Audio preprocessing\n(DC removal, HPF, LPF)"]
+    PRE --> VAD["Voice activity detection"]
+    PRE --> PITCH["Pitch detection"]
+    PRE --> ENV["Amplitude / envelope detection"]
+    VAD --> GEN["MIDI note generation"]
+    PITCH --> GEN
+    ENV --> GEN
+    GEN --> OUT["MIDI output\n(BLE, optionally DIN UART)"]
 ```
 
 ## Component map
@@ -134,15 +136,27 @@ macro in `audio_capture.c`.
 
 ## Threading / data-hand-off model
 
-```
-[ADC ISR] --notify--> [audio_capture task] --xQueueSend(audio_block_t)-->
-    [dsp_task] --mutex-guarded snapshot--> [ui_task]
+```mermaid
+sequenceDiagram
+    participant ISR as ADC ISR
+    participant CAP as audio_capture task
+    participant DSP as dsp_task
+    participant UI as ui_task
+    participant SYN as onboard_synth
+    participant MT as midi_task
+
+    ISR->>CAP: task notify
+    CAP->>DSP: xQueueSend(audio_block_t)
+    DSP->>UI: mutex-guarded voice_analysis_t snapshot
+    DSP->>SYN: onboard_synth_handle_event() (synchronous, spinlock)
+    DSP->>MT: xQueueSend(midi_event_t)
 ```
 
 No component reaches into another's internals; everything crosses a task
-boundary through a typed queue or a mutex-guarded struct. There is exactly
-one producer and one consumer for each hand-off, so no priority-inversion-
-prone multi-writer state exists today.
+boundary through a typed queue, a mutex-guarded struct, or (for
+onboard_synth specifically - see docs/tuning.md for why) a synchronous
+spinlock-guarded call. Each hand-off has exactly one producer and one
+consumer, so no priority-inversion-prone multi-writer state exists today.
 
 ## Why display is a direct SPI driver, not esp_lcd_panel/LVGL
 

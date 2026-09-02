@@ -1,3 +1,5 @@
+[← Docs index](README.md)
+
 # Hardware
 
 Target board: **Espressif ESP-SensairShuttle v1.0**, ESP32-C5-WROOM-1-N16R8

@@ -1,3 +1,5 @@
+[← Project README](../README.md) · [Docs index](../docs/README.md)
+
 # Host-side tests
 
 Tests for this project's hardware-independent DSP/conversion/state-machine

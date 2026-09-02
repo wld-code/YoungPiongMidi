@@ -1,3 +1,5 @@
+[← Docs index](README.md) · New here? Read [tutorials 1-3](tutorials/) first for the concepts behind this document.
+
 # DSP pipeline
 
 ## Current pipeline (implemented)

@@ -1,84 +1,114 @@
+<div align="center">
+
 # YoungPiongMidi
 
-Real-time voice-to-MIDI converter based on the Espressif ESP32-C5.
+**Real-time voice-to-MIDI converter for the Espressif ESP32-C5**
+
+*Sing a note. It plays a note.*
+
+[![Platform](https://img.shields.io/badge/platform-ESP32--C5-blue?logo=espressif)](docs/hardware.md)
+[![Framework](https://img.shields.io/badge/framework-ESP--IDF%20v5.5%2B-green)](https://docs.espressif.com/projects/esp-idf/)
+[![Tests](https://img.shields.io/badge/host%20tests-520%20passing-brightgreen)](test/README.md)
+[![License](https://img.shields.io/badge/license-MIT-informational)](LICENSE)
+
+[Quick start](#-quick-start) ·
+[Architecture](#-architecture) ·
+[Documentation](#-documentation) ·
+[Roadmap](#-roadmap)
+
+</div>
+
+---
 
 YoungPiongMidi listens to a human voice through an analog microphone,
-detects its pitch and dynamics in real time, and turns them into MIDI so
-the voice can drive a synthesizer or DAW like an instrument. It is
-designed to preserve two musical properties of the voice, not just detect
-notes:
+detects its **pitch** and **dynamics** in real time, and turns them into
+MIDI so the voice can drive a synthesizer or DAW like any other
+instrument. It preserves two musical properties of the voice, not just
+"which note":
 
-- **Pitch** -> MIDI note (and eventually pitch bend for continuous
-  intonation).
-- **Dynamics** -> MIDI velocity at note onset, and continuous MIDI CC11
-  Expression while a note is held.
+| Vocal property | Becomes |
+|---|---|
+| 🎵 **Pitch** | A MIDI note (and, eventually, pitch bend for the continuous glide a fretless voice actually has) |
+| 🔊 **Dynamics** | MIDI velocity at note onset, *and* continuous CC11 Expression while the note is held |
 
-## What it does (current status)
+> [!TIP]
+> New to embedded audio DSP, MIDI, or real-time firmware? **[docs/tutorials/](docs/tutorials/)**
+> explains every concept this project uses - sampling, filters, YIN pitch
+> detection, state machines, FreeRTOS scheduling, PDM audio - from first
+> principles, with diagrams, before showing how this codebase applies it.
 
-**Implemented and verified on real hardware**: continuous microphone
-acquisition (ADC continuous mode + DMA, no blocking one-shot reads), DC
-removal, high-pass and low-pass filtering, RMS, an attack/release
-envelope follower, debounced voice-activity detection, YIN
-fundamental-frequency (pitch) detection, frequency -> MIDI note
-conversion (note name, octave, cents deviation), a note-stabilization
-state machine (debounces raw pitch fluctuation into real MIDI Note On/Off
-events - the classic "a wobble must not spam Note On/Off/On/Off" problem),
-vocal-dynamics -> MIDI velocity mapping and continuous CC11 Expression
-while a note is held (both a perceptual/log curve, not raw linear - see
-"Testing"), and a transport-independent MIDI event queue, all running as
-dedicated FreeRTOS tasks and displayed live on the on-board LCD plus
-rate-limited serial diagnostics. The pitch/note/state-machine/dynamics
-logic is also covered by a real, passing host-side test suite - see
-"Testing" below. A real-time audio monitor (`tools/acid_synth_monitor.py`)
-lets you *hear* the generated MIDI events live, through a small acid/
-TB-303-style synth, before any wire transport exists - see "Live
-acid-synth monitor" below.
+## 📊 Status at a glance
 
-**Not yet implemented**: an actual MIDI transport (BLE/UART - Note On/
-Off/CC events are generated and queued for real today, but only reach a
-diagnostic log line, not a wire) and pitch bend. See "Roadmap" below and
-`docs/architecture.md` for the full milestone list. This is deliberate,
-incremental development, not an oversight - the project spec this
-firmware follows explicitly asks for each stage to be proven (on
-hardware, and where possible in an automated test) before the next is
-built on top of it.
+| | |
+|---|---|
+| ✅ **Working, on real hardware, right now** | Mic → pitch → MIDI note → velocity → CC11 → sound, entirely on-device |
+| 🔊 **You can already hear it** | Board's own speaker, or `tools/acid_synth_monitor.py` on a computer |
+| 🧪 **520 host-side test checks** | No board required - `cd test && make` |
+| 🚧 **Not yet implemented** | A wire MIDI transport (BLE/UART) and pitch bend - see [Roadmap](#-roadmap) |
 
-## Hardware
+Every item marked done below has been built **and verified on the
+physical board**, not just compiled - see [Current status](#-current-status)
+for the honest, measured detail (including the real bugs found and fixed
+along the way).
 
-- **Board**: Espressif ESP-SensairShuttle v1.0
-- **MCU/module**: ESP32-C5-WROOM-1-N16R8 (16 MB flash, 8 MB PSRAM)
-- **Microphone**: analog, pre-amplified by the board's front-end, on
-  GPIO6 / ADC1 channel 5
-- **Display**: ST7789P3, 1.83", 240x284, 4-wire SPI
-- **Framework**: ESP-IDF v5.5.5 (latest stable release with ESP32-C5
-  support at time of writing)
+## 🚀 Quick start
 
-Every pin used by this firmware is verified, not guessed - see
-`docs/hardware.md` for the full sourcing trail against Espressif's own
-documentation and factory firmware for this exact board.
+```sh
+# 1. Build
+. $IDF_PATH/export.sh
+idf.py set-target esp32c5
+idf.py build
 
-## Architecture
+# 2. Flash and watch it work
+idf.py -p /dev/cu.usbmodemXXXX flash monitor
 
-```
-Microphone
-    |
-ADC + DMA
-    |
-Audio DSP (DC removal, HPF/LPF, RMS, envelope, VAD)
-    |
-Pitch + Dynamics            <- pitch (YIN), note conversion, velocity done
-    |
-Voice-to-MIDI Engine        <- note-stabilization state machine done
-    |
-MIDI                        <- event queue done; no real transport yet
-    |
-Synthesizer / DAW
+# 3. Run the host-side test suite (no board needed)
+cd test && make
 ```
 
-See `docs/architecture.md` for the component map, task list (priorities
-and stack sizes), and the reasoning behind them.
+(On Linux, the serial port is typically `/dev/ttyACM0`. ESP32-C5 uses
+native USB-Serial/JTAG, so no external USB-UART bridge or drivers are
+needed.) Full detail in [Build & flash](#️-build--flash) below.
 
-## Repository layout
+## 🏗️ Architecture
+
+```mermaid
+flowchart LR
+    MIC(["🎙️ Microphone"]) --> ADC["ADC + DMA"]
+    ADC --> DSP["Audio DSP\nHPF/LPF · RMS · envelope · VAD"]
+    DSP --> PITCH["Pitch + Dynamics\nYIN · note conversion · velocity"]
+    PITCH --> ENGINE["Voice-to-MIDI Engine\nnote-stabilization state machine"]
+    ENGINE --> MIDIQ["MIDI event queue"]
+    MIDIQ --> OUT(["🔊 Synthesizer / DAW"])
+
+    style MIC fill:#4a4,color:#fff
+    style OUT fill:#48c,color:#fff
+```
+
+Every stage above is **implemented and running today** except the final
+hop to an external synth/DAW - `MIDIQ` currently reaches the console
+log and the board's own onboard synth, not a wire (BLE/UART are
+[Milestones 8-9](#-roadmap)). See `docs/architecture.md` for the full
+component map, FreeRTOS task table (priorities, stack sizes, and *why*),
+and the reasoning behind every design choice.
+
+## 🔩 Hardware
+
+| | |
+|---|---|
+| **Board** | Espressif ESP-SensairShuttle v1.0 |
+| **MCU / module** | ESP32-C5-WROOM-1-N16R8 (16 MB flash, 8 MB PSRAM) |
+| **Microphone** | Analog, pre-amplified on-board, `GPIO6` / ADC1 channel 5 |
+| **Display** | ST7789P3, 1.83″, 240×284, 4-wire SPI |
+| **Framework** | ESP-IDF v5.5.5 (latest stable with ESP32-C5 support) |
+
+> [!NOTE]
+> Every pin used by this firmware is **verified against Espressif's own
+> documentation and factory firmware for this exact board**, not
+> guessed - see [`docs/hardware.md`](docs/hardware.md) for the full
+> sourcing trail.
+
+## 📁 Repository layout
 
 ```
 main/               App entry point, task wiring
@@ -88,18 +118,19 @@ components/
   audio_dsp/        RMS, envelope, voice-activity detection
   pitch/            YIN fundamental-frequency detection
   voice_midi/       Frequency<->MIDI note conversion, dynamics->velocity,
-                     note-stabilization state machine
-  midi/             Transport-independent MIDI event queue (no BLE/UART
-                     transport yet - Milestones 8-9)
+                     note-stabilization state machine, CC11 expression
+  midi/             Transport-independent MIDI event queue + onboard synth
+                     (no BLE/UART transport yet - Milestones 8-9)
   display/          ST7789P3 driver + UI primitives
-docs/               architecture.md, hardware.md, dsp.md, midi.md, tuning.md
+docs/
+  architecture.md, hardware.md, dsp.md, midi.md, tuning.md
+  tutorials/        📚 concept-by-concept explanations, from first
+                     principles, with diagrams
 test/               Host-side tests (real, passing - see test/README.md)
-tools/              acid_synth_monitor.py (real-time audio monitor, see
-                     "Live acid-synth monitor" below); plot_audio.py,
-                     analyze_pitch.py not yet written
+tools/              acid_synth_monitor.py - real-time audio monitor
 ```
 
-## Build instructions
+## 🛠️ Build & flash
 
 Requires [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c5/get-started/index.html)
 v5.5 or later (for ESP32-C5 support).
@@ -108,21 +139,13 @@ v5.5 or later (for ESP32-C5 support).
 . $IDF_PATH/export.sh
 idf.py set-target esp32c5
 idf.py build
-```
-
-## Flash instructions
-
-```sh
 idf.py -p /dev/cu.usbmodemXXXX flash monitor
 ```
 
-(On Linux, the port is typically `/dev/ttyACM0`. ESP32-C5 uses native
-USB-Serial/JTAG, so no external USB-UART bridge or drivers are needed.)
+## 🧪 Testing
 
-## Testing
-
-The frequency<->MIDI-note conversion, RMS, envelope follower, YIN pitch
-detector, note-stabilization state machine, dynamics->velocity mapping,
+The frequency↔MIDI-note conversion, RMS, envelope follower, YIN pitch
+detector, note-stabilization state machine, dynamics→velocity mapping,
 and CC11 expression throttling all have real, hardware-independent unit
 tests:
 
@@ -131,157 +154,159 @@ cd test
 make            # builds and runs every suite; fails loudly on any failure
 ```
 
-No ESP-IDF or board required - see `test/README.md` for what each suite
-actually checks. As of this writing: 520 checks across 7 suites, all
-passing - including a direct test of the spec's own anti-flicker
-requirement ("a small pitch fluctuation must not generate Note Off/On/Off/On
-continuously"), a measured demonstration that the default log velocity
-curve reads meaningfully higher than a raw linear one at ordinary singing
-levels (the spec's own warning against "poor musical behaviour" from a
-simple linear mapping), and an explicit check of the CC11 throttle's two
-gates (value delta and minimum interval) independently - see docs/midi.md
-for why both are required rather than either alone.
+No ESP-IDF or board required - see [`test/README.md`](test/README.md)
+for what each suite checks. As of this writing: **520 checks across 7
+suites, all passing**, including:
 
-## Hearing MIDI output before Milestone 8/9 exist
+- a direct test of the spec's own anti-flicker requirement (*"a small
+  pitch fluctuation must not generate Note Off/On/Off/On continuously"*)
+- a measured demonstration that the default log-curve velocity mapping
+  reads meaningfully higher than a raw linear one at ordinary singing
+  levels (the spec's warning against *"poor musical behaviour"* from a
+  simple linear mapping)
+- an explicit, independent check of the CC11 throttle's two gates (value
+  delta **and** minimum interval) - see [`docs/midi.md`](docs/midi.md)
+  for why both are required rather than either alone
 
-There is no wire MIDI transport yet (see "Roadmap"), so two things let
-you *hear* what the firmware is deciding, live - both driven by the
-exact same `midi_task` events, both audible the moment a note fires:
+## 🔊 Hearing MIDI output before Milestone 8/9 exist
 
-1. **The board's own speaker** - always on, no setup, nothing to run.
-   `components/midi/onboard_synth.c` renders every event to a small
-   fixed-point square/PWM voice (velocity -> amplitude, CC11 Expression
-   -> pulse width). See docs/midi.md for why this voice has no resonant
-   filter (a real, measured instability found in the Python synth below
-   made that not worth reproducing in fixed-point on a chip with no
-   FPU). Because the mic and speaker are physically close together on
-   this board, playing loud enough for the mic to pick the speaker back
-   up can cause an audible feedback loop - if the board starts
-   self-triggering notes, that's what's happening, not a firmware bug.
-2. **`tools/acid_synth_monitor.py`** (below) - a different, filtered
-   acid/TB-303-style voice running on a connected computer, useful when
-   you want the richer sound or a WAV capture.
+There's no wire MIDI transport yet, so two things let you *hear* what
+the firmware is deciding, live - both driven by the exact same
+`midi_send_*()` calls, both audible the moment a note fires:
 
-### Live acid-synth monitor (host tool)
+<table>
+<tr>
+<td width="50%" valign="top">
 
-`tools/acid_synth_monitor.py` is a development tool that lets a
-connected computer *hear* what the firmware is deciding, live: it reads
-the board's serial console, parses the same `NOTE_ON`/`NOTE_OFF`/`CC`
-lines `midi_task` logs, and plays them through a small monophonic
-acid/TB-303-style synth (sawtooth oscillator -> resonant lowpass filter,
-with the filter's classic
-"squelch" envelope retriggered per note, velocity driving accent, and
-CC11 Expression sweeping the filter cutoff live).
+### 🎛️ The board's own speaker
+
+Always on, no setup, nothing to run. `components/midi/onboard_synth.c`
+renders every event to a small fixed-point square/PWM voice (velocity →
+amplitude, CC11 → pulse width), ~12ms latency budget end to end.
+
+> [!WARNING]
+> The mic and speaker sit close together on this board. Loud enough
+> playback can be picked back up by the mic and create an audible
+> feedback loop - if the board starts self-triggering notes, that's
+> what's happening, not a firmware bug.
+
+</td>
+<td width="50%" valign="top">
+
+### 🖥️ `tools/acid_synth_monitor.py`
+
+A richer, filtered acid/TB-303-style voice on a connected computer -
+useful for the nicer sound or a WAV capture.
 
 ```sh
 pip install pyserial numpy sounddevice
-python3 tools/acid_synth_monitor.py                       # auto-detects /dev/cu.usbmodem*
-python3 tools/acid_synth_monitor.py --self-test            # plays a fixed riff, no board needed -
-                                                             # use this first to check the audio path itself
-python3 tools/acid_synth_monitor.py --list-devices          # see output device indices/names
-python3 tools/acid_synth_monitor.py --device 2               # force a specific output device
-python3 tools/acid_synth_monitor.py --play-seconds 10        # auto-stop instead of Ctrl+C
-python3 tools/acid_synth_monitor.py --record-seconds 10 --wav-out clip.wav  # headless capture, no audio device
+python3 tools/acid_synth_monitor.py
 ```
 
-**If you don't hear anything**: this is almost always audio *routing*,
-not a bug in the synth - `--self-test` isolates the two. macOS's default
-output device index can silently change (e.g. a Bluetooth headset
-connecting/disconnecting shifts every other device's index and can
-leave the *system* default pointed at a device that isn't actually
-active) - `--list-devices` shows the current, real device list;
-`--device N` pins a specific one (e.g. built-in speakers) so playback
-doesn't depend on whatever the system currently considers "default." If
-`--self-test` plays fine but the normal (board-connected) mode is
-silent, that's not a bug either - it means no note has crossed
-`YP_PITCH_CONFIDENCE_THRESHOLD` recently (the room is quiet, or nothing
-is near the mic); make some noise near the board's microphone.
+`--self-test` plays a fixed riff with no board needed (isolates audio
+routing problems), `--list-devices`/`--device N` pick the output,
+`--record-seconds N --wav-out f.wav` captures headlessly.
 
-This is a verification/demo tool, not a project deliverable - it does
-not modify or depend on any change to the firmware, and it has nothing
-to do with the eventual BLE/UART transports (Milestones 8-9). It has
-been run against real hardware: a 10-second capture with the board
-picking up ambient sound produced real, live-generated `NOTE_ON`/`CC`/
-`NOTE_OFF` sequences and non-clipping, non-silent audio that tracks note
-activity exactly - see the recording sent alongside this project's
-development conversation.
+</td>
+</tr>
+</table>
 
-## How to use it
+Both voices are deliberately simple oscillators, not full synthesizers -
+see [`docs/tutorials/07-audio-synthesis-pdm.md`](docs/tutorials/07-audio-synthesis-pdm.md)
+for why, including a real numerical-instability bug found (and avoided
+on-device) while building the richer Python one.
 
-Power the board (or plug it into a PC over USB) and watch the console:
-diagnostics print at a rate-limited interval (`YP_DEBUG_LOG_INTERVAL_MS`
-in `yp_config.h`) as, e.g.,
-`pitch=440.2Hz note=A4 midi=69 cents=0.8 confidence=0.96 rms=... velocity=84 expr=72 state=NOTE_ACTIVE clipped=0`
+## 📖 How to use it
+
+Power the board (or plug it into a PC over USB) and watch the console.
+Diagnostics print at a rate-limited interval as, e.g.:
+
+```
+pitch=440.2Hz note=A4 midi=69 cents=0.8 confidence=0.96 rms=0.13 velocity=84 expr=72 state=NOTE_ACTIVE clipped=0
+```
+
 (or `note=---` while confidence is below `YP_PITCH_CONFIDENCE_THRESHOLD`,
-0.55 by default), and the LCD shows the same note/frequency/confidence, a
-live level meter, and RMS/status/expression. Speaking or singing a
-sustained, clear pitch into the microphone should move the level meter,
-flip `voice_active` to 1, show a note name (e.g. `NOTE A4  +1C`) instead
-of `NOTE ---`, and - once held stably for a few frames - produce a real
-`midi: NOTE_ON  ch=0 note=69 vel=84` line as the note-stabilization state
-machine commits it, followed by `midi: CC ch=0 cc=11 val=...` lines
-tracking your voice's loudness while the note is held - and, at the same
-moment, a real sound from **the board's own speaker** (a small onboard
-square/PWM synth voice - see "Live acid-synth monitor" below). There is
-no wire MIDI output yet (BLE/UART are Milestones 8-9) - events are
-generated and queued for real, but the only ways to observe them today
-are that log line, the board's own speaker, or
-`tools/acid_synth_monitor.py` on a connected computer (which parses the
-same log over serial into a different, filtered synth sound).
+0.55 by default). The LCD mirrors the same note/frequency/confidence, a
+live level meter, and RMS/status/expression.
 
-## Current status
+Speaking or singing a sustained, clear pitch into the microphone should:
 
-As of the last verification pass (see `docs/hardware.md` and
-`docs/tuning.md` for details), this firmware was built, flashed, and run
-on a physical ESP-SensairShuttle v1.0 / ESP32-C5. It boots cleanly,
-initializes the display and microphone, runs a boot self-test (LCD color
-cycle + speaker melody), and runs the full acquisition ->
-RMS/envelope/VAD/YIN -> note-state-machine -> CC11-expression ->
-MIDI-event-queue pipeline continuously with no crashes and stable memory
-usage over multi-minute runs. Measured `dsp_task` time per hop is ~4.7 ms average (worst case
-~13 ms on the 1-in-3 hops that run the full YIN analysis, absorbed by the
-capture queue) - see docs/dsp.md for how that number was arrived at,
-including a real finding along the way: ESP32-C5 has no hardware FPU, and
-the first all-`float` YIN implementation measured ~79 ms/hop before being
-rewritten in fixed-point.
+1. Move the level meter and flip `voice_active` to 1
+2. Show a note name (e.g. `NOTE A4  +1C`) instead of `NOTE ---`
+3. Once held stably for a few frames, produce `midi: NOTE_ON ch=0 note=69 vel=84` -
+   the note-stabilization state machine committing a real event
+4. Followed by `midi: CC ch=0 cc=11 val=...` lines tracking your voice's
+   loudness while the note is held
+5. And, at the same moment, real sound from the **board's own speaker**
 
-The note-stabilization state machine's and velocity mapping's *logic*
-(Milestones 5-6) is verified by 256 host-side test checks rather than a
-live singing session in this particular verification pass - deliberately,
-not as a shortcut: their correctness lives in exact frame-by-frame/
-millisecond-boundary behavior (does a change get honored one frame too
-early? does a one-frame dropout wrongly release a note? does the log
-curve actually read meaningfully higher than linear at ordinary levels?)
+There is no wire MIDI output yet - events are generated and queued for
+real, but the only ways to observe them today are the console log, the
+board's own speaker, or the host tool above.
+
+## ✅ Current status
+
+As of the last verification pass (see [`docs/hardware.md`](docs/hardware.md)
+and [`docs/tuning.md`](docs/tuning.md) for full detail), this firmware
+was built, flashed, and run on a physical ESP-SensairShuttle v1.0 /
+ESP32-C5. It boots cleanly, runs a boot self-test (LCD color cycle +
+speaker melody), and runs the full
+**acquisition → RMS/envelope/VAD/YIN → note-state-machine → CC11-expression
+→ MIDI-event-queue → onboard synth** pipeline continuously, with no
+crashes and stable memory usage over multi-minute runs.
+
+**Measured, not assumed**: `dsp_task` averages ~4.7ms per 8ms hop
+(worst case ~13ms on the YIN-heavy hops, absorbed by the capture queue);
+the onboard synth's round-trip audio latency is ~12ms.
+
+> [!IMPORTANT]
+> **Real bugs found and fixed along the way, documented rather than
+> hidden** (full detail in `docs/tuning.md`):
+> - **No hardware FPU on ESP32-C5.** The first all-`float` YIN
+>   implementation measured ~79ms/hop against an 8ms budget - fixed with
+>   fixed-point arithmetic + decimated analysis.
+> - **LCD showed nothing at first boot.** Traced (via Espressif's own
+>   schematic, not guessed) to `GPIO5`/`PWR_CTRL` being an
+>   active-**low** power switch, driven backwards initially.
+> - **Onboard synth audio lagged the MIDI log by ~90ms.** Traced to the
+>   I2S driver's default DMA buffer sizing plus an unnecessary
+>   task-queue hop - both fixed, verified down to ~12ms.
+
+The note-stabilization state machine's and velocity mapping's *logic* is
+verified by 256 of the 520 host-side test checks rather than a live
+singing session in any one verification pass - deliberately: their
+correctness lives in exact frame-by-frame/millisecond-boundary behavior
 that a host test can assert on deterministically and a live mic session
-cannot. The hardware run confirms the *integration* - it boots,
-initializes the MIDI queue, and runs the whole pipeline with zero
-regressions - which is what hardware verification can actually add on
-top of the host tests here.
+cannot. Hardware runs confirm the *integration* - zero regressions,
+every time - which is what hardware verification can actually add on
+top of the host tests.
 
-Two other real bring-up findings worth knowing about, both already fixed
-and documented in `docs/hardware.md`/`docs/tuning.md`: the LCD initially
-showed nothing because `GPIO5`/`PWR_CTRL` is an active-**low** power-rail
-switch (traced via Espressif's own schematic, not guessed) that the first
-firmware revision drove backwards; and the microphone's `clipped` flag
-was stuck true until that same LCD fix, most likely because the
-unpowered-but-still-clocked panel was coupling noise into the analog
-front-end.
+## 🗺️ Roadmap
 
-## Roadmap
-
-| Milestone | Description | Status |
+| # | Milestone | Status |
 |---|---|---|
-| 1 | Continuous mic acquisition + basic signal display | Done |
-| 2 | RMS/envelope + voice activity detection | Done |
-| 3 | Fundamental frequency detection (YIN) | Done |
-| 4 | Frequency -> MIDI note conversion | Done, host-tested + verified on hardware |
-| 5 | MIDI Note On/Off generation | Done, host-tested + verified on hardware |
-| 6 | Vocal dynamics -> MIDI velocity | Done, host-tested + verified on hardware |
-| 7 | Continuous CC11 Expression | Done, host-tested + verified on hardware |
-| 8 | BLE MIDI | Planned |
-| 9 | DIN MIDI over UART (optional) | Planned |
-| 10 | Pitch bend for continuous vocal pitch | Planned |
+| 1 | Continuous mic acquisition + basic signal display | ✅ Done |
+| 2 | RMS/envelope + voice activity detection | ✅ Done |
+| 3 | Fundamental frequency detection (YIN) | ✅ Done |
+| 4 | Frequency → MIDI note conversion | ✅ Done · tested · verified |
+| 5 | MIDI Note On/Off generation | ✅ Done · tested · verified |
+| 6 | Vocal dynamics → MIDI velocity | ✅ Done · tested · verified |
+| 7 | Continuous CC11 Expression | ✅ Done · tested · verified |
+| 8 | BLE MIDI | 🚧 Planned |
+| 9 | DIN MIDI over UART (optional) | 🚧 Planned |
+| 10 | Pitch bend for continuous vocal pitch | 🚧 Planned |
 
-## License
+## 📚 Documentation
 
-MIT - see `LICENSE`.
+| Document | What it's for |
+|---|---|
+| [`docs/tutorials/`](docs/tutorials/) | **Start here if concepts are new to you.** Sampling, filters, YIN, MIDI, state machines, FreeRTOS, PDM audio - explained from first principles, with diagrams |
+| [`docs/architecture.md`](docs/architecture.md) | Component map, FreeRTOS task table, and the design reasoning behind this codebase specifically |
+| [`docs/hardware.md`](docs/hardware.md) | Pin sourcing trail, board bring-up, and hardware findings |
+| [`docs/dsp.md`](docs/dsp.md) | The DSP pipeline's implementation detail |
+| [`docs/midi.md`](docs/midi.md) | The MIDI engine's design and implementation detail |
+| [`docs/tuning.md`](docs/tuning.md) | Every real bug found on real hardware, with the measurements behind each fix |
+| [`test/README.md`](test/README.md) | What each host-side test suite actually checks |
+
+## 📄 License
+
+MIT - see [`LICENSE`](LICENSE).
