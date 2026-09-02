@@ -70,7 +70,12 @@ yp_note_info_t yp_frequency_to_note_info(float frequency_hz)
     return info;
 }
 
-int yp_level_to_velocity(float level, yp_vel_curve_t curve)
+/**
+ * @brief Shared clamp + curve-shape step used by both yp_level_to_velocity()
+ *        and yp_level_to_cc_value() - the two differ only in what integer
+ *        range the resulting 0..1 fraction gets scaled into.
+ */
+static float normalize_level(float level, yp_vel_curve_t curve)
 {
     float clamped = level;
     if (clamped < YP_DYNAMICS_NOISE_FLOOR) clamped = YP_DYNAMICS_NOISE_FLOOR;
@@ -79,8 +84,8 @@ int yp_level_to_velocity(float level, yp_vel_curve_t curve)
     float normalized; /* 0..1 */
     if (curve == YP_VEL_CURVE_LOG) {
         /* Linear in dB, not in level: quiet-to-medium changes get
-         * proportionally more of the velocity range, tracking perceived
-         * loudness better than a raw linear mapping (see voice_midi.h). */
+         * proportionally more of the range, tracking perceived loudness
+         * better than a raw linear mapping (see voice_midi.h). */
         float db_min = 20.0f * log10f(YP_DYNAMICS_NOISE_FLOOR);
         float db_max = 20.0f * log10f(YP_DYNAMICS_MAX_RMS);
         float db = 20.0f * log10f(clamped);
@@ -90,10 +95,28 @@ int yp_level_to_velocity(float level, yp_vel_curve_t curve)
     }
     if (normalized < 0.0f) normalized = 0.0f;
     if (normalized > 1.0f) normalized = 1.0f;
+    return normalized;
+}
 
+int yp_level_to_velocity(float level, yp_vel_curve_t curve)
+{
+    float normalized = normalize_level(level, curve);
     int velocity = YP_MIDI_VELOCITY_MIN
                     + (int)lroundf(normalized * (float)(YP_MIDI_VELOCITY_MAX - YP_MIDI_VELOCITY_MIN));
     if (velocity < YP_MIDI_VELOCITY_MIN) velocity = YP_MIDI_VELOCITY_MIN;
     if (velocity > YP_MIDI_VELOCITY_MAX) velocity = YP_MIDI_VELOCITY_MAX;
     return velocity;
+}
+
+int yp_level_to_cc_value(float level, yp_vel_curve_t curve)
+{
+    /* Unlike velocity (1..127 - 0 is reserved by the MIDI spec to mean
+     * "note off" when used as a Note On velocity), a CC value's full
+     * legal range is 0..127, so this does not offset by a MIN like
+     * yp_level_to_velocity() does. */
+    float normalized = normalize_level(level, curve);
+    int value = (int)lroundf(normalized * 127.0f);
+    if (value < 0) value = 0;
+    if (value > 127) value = 127;
+    return value;
 }

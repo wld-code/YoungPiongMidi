@@ -45,15 +45,15 @@ components/
                  swappable for a different algorithm later.
   voice_midi/    Frequency<->MIDI note conversion (Milestone 4, done -
                  voice_midi.c/.h), the note-stabilization state machine
-                 (Milestone 5, done - note_state_machine.c), and
-                 dynamics->velocity mapping (Milestone 6, done - see
-                 docs/midi.md for what "done" covers vs. Milestone 7's
-                 CC11). All pure math/state, no ESP-IDF dependency,
-                 host-tested (test/test_midi_notes.c,
-                 test/test_note_state_machine.c, test/test_dynamics.c:
-                 437 checks between them). Decides *when*/*what* a MIDI
-                 event should be,
-                 never touches a queue or transport itself.
+                 (Milestone 5, done - note_state_machine.c),
+                 dynamics->velocity mapping (Milestone 6, done), and
+                 continuous CC11 Expression while a note is held
+                 (Milestone 7, done - expression.c). All pure math/state,
+                 no ESP-IDF dependency, host-tested
+                 (test/test_midi_notes.c, test/test_note_state_machine.c,
+                 test/test_dynamics.c, test/test_expression.c: 490
+                 checks between them). Decides *when*/*what* a MIDI event
+                 should be, never touches a queue or transport itself.
   midi/          Transport-independent MIDI event queue + midi_task
                  (Milestone 5, done - midi.h/.c): builds midi_event_t
                  from voice_midi's decisions and dispatches to whichever
@@ -74,8 +74,8 @@ main/            Task wiring: creates dsp_task and ui_task, starts
 ```
 
 `components/pitch`, `components/voice_midi` and `components/midi` are
-all implemented now (see above), covering Milestones 1-6. Milestones
-7-10 (CC11 expression, BLE, DIN UART, pitch bend) are not started.
+all implemented now (see above), covering Milestones 1-7. Milestones
+8-10 (BLE, DIN UART, pitch bend) are not started.
 
 ## FreeRTOS architecture
 
@@ -168,7 +168,7 @@ Matches the project spec's Section 22. Status as of this document:
 | 4 | Frequency -> MIDI note conversion | Done, host-tested + verified on hardware |
 | 5 | MIDI Note On/Off generation | Done, host-tested + verified on hardware |
 | 6 | Vocal dynamics -> MIDI velocity | Done, host-tested + verified on hardware |
-| 7 | Continuous CC11 Expression | Not started |
+| 7 | Continuous CC11 Expression | Done, host-tested + verified on hardware |
 | 8 | BLE MIDI | Not started |
 | 9 | DIN MIDI over UART (optional) | Not started |
 | 10 | Pitch bend for continuous vocal pitch | Not started |

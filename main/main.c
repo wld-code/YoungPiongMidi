@@ -8,9 +8,10 @@
  * 4 (frequency -> MIDI note conversion - see components/voice_midi),
  * 5 (note-stabilization state machine + MIDI Note On/Off generation -
  * see components/voice_midi/note_state_machine.c and components/midi),
- * and 6 (vocal dynamics -> MIDI velocity - yp_level_to_velocity() in
+ * 6 (vocal dynamics -> MIDI velocity - yp_level_to_velocity() in
  * components/voice_midi/voice_midi.c, called from the state machine at
- * Note On/Change time).
+ * Note On/Change time), and 7 (continuous CC11 Expression while a note
+ * is held - components/voice_midi/expression.c).
  * See docs/architecture.md for the full roadmap and README.md for status.
  *
  * Task layout (see docs/architecture.md "FreeRTOS architecture" for the
@@ -61,6 +62,7 @@ static bool s_latest_clipped;
 /* Owned by dsp_task alone (single writer, no locking needed) - see the
  * "why not its own task" reasoning in the file header comment. */
 static yp_note_sm_t s_note_sm;
+static yp_expression_t s_expression;
 
 /* -------------------------------------------------------------------- */
 /*  dsp_task: consumes audio blocks, runs the DSP pipeline, publishes    */
@@ -123,6 +125,7 @@ static void dsp_task(void *arg)
         switch (note_event.type) {
             case YP_NOTE_EVENT_NOTE_ON:
                 midi_send_note_on(YP_MIDI_CHANNEL, note_event.note_on_number, note_event.velocity);
+                yp_expression_init(&s_expression); /* fresh baseline for this note */
                 break;
             case YP_NOTE_EVENT_NOTE_OFF:
                 midi_send_note_off(YP_MIDI_CHANNEL, note_event.note_off_number, 0);
@@ -130,10 +133,24 @@ static void dsp_task(void *arg)
             case YP_NOTE_EVENT_NOTE_CHANGE:
                 midi_send_note_off(YP_MIDI_CHANNEL, note_event.note_off_number, 0);
                 midi_send_note_on(YP_MIDI_CHANNEL, note_event.note_on_number, note_event.velocity);
+                /* Deliberately NOT reset here: CC11 tracks the channel's
+                 * continued dynamics, not any one note's - a change in
+                 * pitch mid-phrase shouldn't discard the expression
+                 * trend the singer was already establishing. */
                 break;
             case YP_NOTE_EVENT_NONE:
             default:
                 break;
+        }
+
+        /* Continuous CC11 Expression (Milestone 7) - only while a note is
+         * actually held; see yp_expression_process()'s doc comment in
+         * voice_midi.h for the delta+interval throttling. */
+        if (YP_CC11_ENABLED && s_note_sm.state == YP_NOTE_STATE_NOTE_ACTIVE) {
+            int cc_value;
+            if (yp_expression_process(&s_expression, analysis.level, t_process_end, &cc_value)) {
+                midi_send_cc(YP_MIDI_CHANNEL, YP_MIDI_CC_EXPRESSION, (uint8_t)cc_value);
+            }
         }
 
         int64_t now = t_process_end;
@@ -151,9 +168,10 @@ static void dsp_task(void *arg)
             if (analysis.confidence >= YP_PITCH_CONFIDENCE_THRESHOLD && analysis.frequency_hz > 0.0f) {
                 yp_note_info_t note = yp_frequency_to_note_info(analysis.frequency_hz);
                 int velocity = yp_level_to_velocity(analysis.level, (yp_vel_curve_t)YP_DEFAULT_VELOCITY_CURVE);
-                ESP_LOGI(TAG, "pitch=%.1fHz note=%s%d midi=%d cents=%.1f confidence=%.2f rms=%.4f velocity=%d state=%s clipped=%d",
+                ESP_LOGI(TAG, "pitch=%.1fHz note=%s%d midi=%d cents=%.1f confidence=%.2f rms=%.4f velocity=%d expr=%d state=%s clipped=%d",
                          analysis.frequency_hz, note.note_name, note.octave, note.midi_note, note.cents,
-                         analysis.confidence, analysis.rms, velocity, state_label, block.clipped);
+                         analysis.confidence, analysis.rms, velocity, s_expression.last_sent_value,
+                         state_label, block.clipped);
             } else {
                 ESP_LOGI(TAG, "pitch=%.1fHz note=--- confidence=%.2f rms=%.4f level=%.4f state=%s clipped=%d",
                          analysis.frequency_hz, analysis.confidence,
@@ -198,6 +216,7 @@ static void dsp_task(void *arg)
 #define UI_Y_RMS        (UI_Y_METER + UI_METER_H + 12)
 #define UI_Y_STATUS_LBL (UI_Y_RMS + 20)
 #define UI_Y_STATUS_VAL (UI_Y_STATUS_LBL + 16)
+#define UI_Y_EXPR       (UI_Y_STATUS_VAL + 20)
 
 static void ui_draw_static(void)
 {
@@ -271,6 +290,16 @@ static void ui_task(void *arg)
                                      : (analysis.voice_active ? DISPLAY_COLOR_GREEN : DISPLAY_COLOR_GRAY);
             display_fill_rect(8, UI_Y_STATUS_VAL, DISPLAY_WIDTH - 16, 10, DISPLAY_COLOR_BLACK);
             display_draw_text(8, UI_Y_STATUS_VAL, status, status_color, DISPLAY_COLOR_BLACK, 1);
+
+            /* CC11 Expression (Milestone 7) - only meaningful while a
+             * note is held; s_expression.last_sent_value is -1 between
+             * notes (see yp_expression_init()). */
+            if (s_note_sm.state == YP_NOTE_STATE_NOTE_ACTIVE && s_expression.last_sent_value >= 0) {
+                snprintf(line, sizeof(line), "EXPR%4d", s_expression.last_sent_value);
+            } else {
+                snprintf(line, sizeof(line), "EXPR%4s", "--");
+            }
+            display_draw_text(8, UI_Y_EXPR, line, DISPLAY_COLOR_CYAN, DISPLAY_COLOR_BLACK, 1);
         }
 
         vTaskDelayUntil(&last_wake, period);

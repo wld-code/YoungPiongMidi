@@ -103,6 +103,16 @@ typedef enum {
  */
 int yp_level_to_velocity(float level, yp_vel_curve_t curve);
 
+/**
+ * @brief Map an envelope-followed amplitude to a raw MIDI controller
+ *        value, 0..127 (the full CC range - unlike velocity, 0 is not
+ *        reserved). Same clamping/curve behavior as yp_level_to_velocity(),
+ *        just scaled to [0, 127] instead of [YP_MIDI_VELOCITY_MIN,
+ *        YP_MIDI_VELOCITY_MAX]. Used for CC11 Expression (see
+ *        yp_expression_process() below).
+ */
+int yp_level_to_cc_value(float level, yp_vel_curve_t curve);
+
 /* -------------------------------------------------------------------- */
 /*  Note-stabilization state machine (project spec section 7)            */
 /* -------------------------------------------------------------------- */
@@ -176,6 +186,61 @@ void yp_note_sm_init(yp_note_sm_t *sm);
  * @return the MIDI event (if any) this hop should produce.
  */
 yp_note_event_t yp_note_sm_process(yp_note_sm_t *sm, const yp_voice_frame_t *frame, int64_t now_us);
+
+/* -------------------------------------------------------------------- */
+/*  Continuous CC11 Expression (project spec section 9, Milestone 7)     */
+/* -------------------------------------------------------------------- */
+
+/**
+ * @brief Rate-limiting state for streaming CC11 while a note is held.
+ *
+ * Owned by the caller (one instance per active note, or reused/reset
+ * across notes - see yp_expression_init()). Deliberately separate from
+ * yp_note_sm_t: the note state machine decides *whether a note exists at
+ * all*; this decides *whether this hop's continued dynamics are worth a
+ * CC11 message*, which is a different, continuous concern the spec
+ * explicitly calls out as distinct from note-onset velocity ("dynamics
+ * must not only be measured at the note onset").
+ */
+typedef struct {
+    int     last_sent_value;   /**< -1 = nothing sent yet since init/reset */
+    int64_t last_sent_time_us;
+} yp_expression_t;
+
+/** Reset so the next yp_expression_process() call always sends (establishes
+ *  a fresh baseline) - call once when a note turns on. */
+void yp_expression_init(yp_expression_t *ex);
+
+/**
+ * @brief Decide whether this hop's level warrants a new CC11 message.
+ *
+ * Only meaningful while a note is active - callers should not invoke
+ * this during SILENCE (there is nothing to attach continued dynamics
+ * to).
+ *
+ * Throttling: per the project spec ("do not flood the MIDI connection;
+ * only transmit when the value changes sufficiently or after a
+ * configurable minimum interval"), a new value is sent only once BOTH
+ * gates pass: the candidate value differs from the last *sent* value by
+ * at least YP_CC11_MIN_DELTA, AND at least YP_CC11_MIN_INTERVAL_MS has
+ * elapsed since the last send. Read literally, the spec's "or" could
+ * also mean either gate alone should be sufficient - deliberately not
+ * implemented that way here: an "or" of two independent conditions is
+ * not actually a rate *cap* (a large, fast-changing delta would still
+ * fire every hop), whereas requiring both is what actually bounds the
+ * message rate to at most one per YP_CC11_MIN_INTERVAL_MS while still
+ * filtering out sub-threshold noise - see docs/midi.md for the full
+ * reasoning. The very first call after yp_expression_init() always
+ * sends, regardless of both gates, to establish a starting value.
+ *
+ * @param ex       tracker state, updated in place
+ * @param level    this hop's envelope level
+ * @param now_us   monotonic timestamp (see yp_note_sm_process() re: clocks)
+ * @param out_value set to the CC value (0..127) to send, only when this
+ *                   function returns true
+ * @return true if a CC11 message should be sent this hop
+ */
+bool yp_expression_process(yp_expression_t *ex, float level, int64_t now_us, int *out_value);
 
 #ifdef __cplusplus
 }

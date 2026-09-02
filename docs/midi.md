@@ -153,14 +153,48 @@ Explicitly **not** what this milestone covers, and not a gap in it:
 tracking dynamics *after* note onset, while a note is held. That is
 Milestone 7's job.
 
-## CC11 Expression (Milestone 7, not yet implemented)
+## CC11 Expression (Milestone 7, implemented)
 
-Would stream continued vocal-intensity changes while a note is held as
-MIDI CC11 (`YP_CC11_ENABLED`, rate-limited by `YP_CC11_MIN_DELTA`/
-`YP_CC11_MIN_INTERVAL_MS` so a continuously-varying voice does not flood
-the MIDI connection). `midi_send_cc()` already exists in
-`components/midi/midi.h` (per the spec's transport-independent engine
-design, built once in Milestone 5) but nothing calls it yet.
+Streams continued vocal-intensity changes while a note is held as MIDI
+CC11 (`YP_CC11_ENABLED`). New `components/voice_midi/expression.c`:
+`yp_expression_t` + `yp_expression_process()`, called from `dsp_task`
+(`main.c`) once per hop whenever `s_note_sm.state == YP_NOTE_STATE_NOTE_ACTIVE`
+- outside an active note there is nothing to attach continued dynamics
+to, per the spec's own "once a note is active" wording. Uses
+`yp_level_to_cc_value()` (`voice_midi.c`), the same clamp/curve logic as
+`yp_level_to_velocity()` but scaled to the CC value's full 0..127 range
+(0 is not reserved for CC the way it is for Note On velocity).
+
+**Throttling - the one genuinely ambiguous piece of spec wording in this
+project**: "Only transmit CC11 when the value changes sufficiently or
+after a configurable minimum interval." Read literally, that "or" could
+mean either condition alone is enough to send. This implementation
+requires **both**: the candidate value must differ from the last *sent*
+value by at least `YP_CC11_MIN_DELTA`, *and* at least
+`YP_CC11_MIN_INTERVAL_MS` must have elapsed since the last send. Chosen
+deliberately, not by default: an "or" of two independent triggers isn't
+actually a rate *cap* - a large, fast-changing delta would still fire
+every single hop, which is exactly the flooding the spec says to avoid.
+Requiring both is what bounds the message rate to at most one per
+`YP_CC11_MIN_INTERVAL_MS` while still filtering out sub-threshold noise.
+The first CC after a note turns on (`yp_expression_init()`, called from
+`main.c` on `YP_NOTE_EVENT_NOTE_ON`) always sends immediately regardless
+of both gates, to establish a starting value for the note rather than
+inheriting whatever the previous note left the channel's expression at.
+`test/test_expression.c`'s `test_large_delta_before_interval_is_withheld`
+and `test_small_delta_alone_does_not_send` check each gate independently,
+so this choice is an asserted behavior, not just a comment.
+
+Deliberately **not** reset on a `NOTE_CHANGE` (only on a fresh `NOTE_ON`
+from silence) - CC11 tracks the *channel's* continued dynamics across a
+sung phrase, not any one note's, so a pitch change mid-phrase shouldn't
+discard an expression trend the singer was already building.
+
+Verified end to end on real hardware, not just in host tests: with the
+board picking up ambient sound, the console shows real sequences like
+`NOTE_ON ch=0 note=57 vel=83` followed by several `CC ch=0 cc=11 val=...`
+messages roughly `YP_CC11_MIN_INTERVAL_MS` apart tracking the level up
+and down, then `NOTE_OFF` - see docs/tuning.md.
 
 ## Pitch bend (Milestone 10, optional)
 
