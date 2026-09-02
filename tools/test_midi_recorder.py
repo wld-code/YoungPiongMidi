@@ -32,36 +32,40 @@ def test_recorder_ignores_events_while_inactive():
 def test_recorder_captures_relative_timing():
     r = MidiRecorder()
     r.start()
-    t0 = r._start_time
+    t0 = r._armed_at
     r.ingest([
         {"t": t0 + 0.10, "kind": "note_on", "note": 60, "velocity": 100},
         {"t": t0 + 0.30, "kind": "note_off", "note": 60, "velocity": 0},
         {"t": t0 + 0.35, "kind": "note_on", "note": 64, "velocity": 90},
     ])
     take = r.stop()
-    # Tolerance is 0.1ms, not the ideal-arithmetic 0, because these are
-    # real time.time() wall-clock magnitudes (~1.7e9 seconds since
-    # epoch) - float64 has ~15-17 significant digits total, so an
-    # addition like `t0 + 0.10` at that magnitude already loses
-    # precision below the microsecond level before ingest() even runs
-    # its own subtraction. Confirmed directly: (t0 + 0.10) - t0 measures
-    # ~0.0999999... in practice, not exactly 0.10 - not a recorder bug,
-    # just what wall-clock float timestamps are. 0.1ms is still far
-    # tighter than anything that matters here (this app's own redraw
-    # tick runs at ~33ms).
+    # rel_t=0 for the *first captured event*, not "0.10s after arm()" -
+    # _start_time is lazy (set to that first event's own timestamp, not
+    # to time.time() at start()) specifically so a note that already
+    # happened microseconds before start() was even called (a real,
+    # observed bug with the sequencer's own pattern notes right at a
+    # bank transition) isn't mistaken for "before this segment began"
+    # and dropped - see MidiRecorder.start()'s docstring. Tolerance is
+    # 0.1ms, not the ideal-arithmetic 0, because these are real
+    # time.time() wall-clock magnitudes (~1.7e9s since epoch) - float64
+    # loses precision below the microsecond level at that magnitude
+    # before ingest() even runs its own subtraction; confirmed directly,
+    # not a recorder bug. Still far tighter than anything that matters
+    # here (this app's own redraw tick runs at ~33ms).
     check("captured 3 events", len(take.events) == 3, f"got {take.events}")
-    check("first event's relative time ~0.10s",
-          abs(take.events[0][0] - 0.10) < 1e-4, f"got {take.events[0]}")
+    check("first event's relative time is 0 (it defines this segment's own t=0)",
+          abs(take.events[0][0] - 0.0) < 1e-4, f"got {take.events[0]}")
     check("events preserved in order", [e[1] for e in take.events] == ["note_on", "note_off", "note_on"])
     check("note/velocity preserved", take.events[0][2] == 60 and take.events[0][3] == 100)
-    check("duration is the last event's relative time", abs(take.duration - 0.35) < 1e-4)
+    check("duration is relative to the first event, not to armed_at",
+          abs(take.duration - 0.25) < 1e-4, f"got {take.duration}")
     check("note_on_count counts only note_on", take.note_on_count() == 2)
 
 
 def test_recorder_ignores_non_note_events():
     r = MidiRecorder()
     r.start()
-    t0 = r._start_time
+    t0 = r._armed_at
     r.ingest([
         {"t": t0 + 0.1, "kind": "cc", "controller": 11, "value": 90},
         {"t": t0 + 0.2, "kind": "note_on", "note": 60, "velocity": 100},
@@ -77,7 +81,7 @@ def test_recorder_never_double_ingests_the_same_event():
     not just append everything it's handed."""
     r = MidiRecorder()
     r.start()
-    t0 = r._start_time
+    t0 = r._armed_at
     batch1 = [{"t": t0 + 0.1, "kind": "note_on", "note": 60, "velocity": 100}]
     r.ingest(batch1)
     batch2 = batch1 + [{"t": t0 + 0.2, "kind": "note_off", "note": 60, "velocity": 0}]
@@ -90,14 +94,14 @@ def test_recorder_never_double_ingests_the_same_event():
 def test_recorder_stop_resets_for_a_fresh_recording():
     r = MidiRecorder()
     r.start()
-    t0 = r._start_time
+    t0 = r._armed_at
     r.ingest([{"t": t0 + 0.1, "kind": "note_on", "note": 60, "velocity": 100}])
     first = r.stop()
     check("first take captured", len(first.events) == 1)
     check("recorder inactive after stop()", not r.active)
 
     r.start()
-    t1 = r._start_time
+    t1 = r._armed_at
     r.ingest([{"t": t1 + 0.1, "kind": "note_on", "note": 72, "velocity": 80}])
     second = r.stop()
     check("second recording starts clean, not appended to the first",
@@ -111,6 +115,37 @@ def test_elapsed_reports_zero_when_not_recording():
     check("elapsed() is >= 0 while active", r.elapsed() >= 0.0)
     r.stop()
     check("elapsed() is 0 again after stop()", r.elapsed() == 0.0)
+
+
+def test_recorder_captures_an_event_logged_before_start_was_called():
+    """The exact regression this fix targets: a background thread (the
+    sequencer's own pattern, in production) can log an event via
+    engine.note_on() microseconds before start() actually gets called
+    and runs - that event's timestamp is then technically *earlier*
+    than time.time() read inside start(). The old, eager
+    _start_time=time.time() made that event look like it happened
+    "before this segment began" (a negative relative time) and get
+    silently dropped by the rel_t<0 guard. _start_time is now lazy
+    (set to the first *captured* event's own timestamp), so this can't
+    happen - there's no eager cutoff to be on the wrong side of.
+
+    Isolates the _start_time concern specifically from the *dedup*
+    cursor (_last_seen_ts): a plain start() with no override correctly
+    still excludes events from further in the past (see
+    test_recorder_ignores_events_while_inactive and
+    LiveRecordSession's own carry-forward tests for that) - passing an
+    explicit last_seen_ts here, earlier than the event, is what
+    set_active_bank() does for a real bank switch, and is what actually
+    exercises the bug this fixes."""
+    r = MidiRecorder()
+    event_time = time.time() - 0.005  # already happened, 5ms in the past, before start() below
+    r.start(last_seen_ts=event_time - 0.01)  # mimics set_active_bank()'s carried-forward cursor
+    r.ingest([{"t": event_time, "kind": "note_on", "note": 66, "velocity": 100}])
+    take = r.stop()
+    check("an event timestamped before start() was called is still captured, not dropped",
+          take.note_on_count() == 1 and not take.is_empty(), f"got {take.events}")
+    check("that event correctly becomes this segment's own t=0",
+          take.events and take.events[0][0] == 0.0, f"got {take.events}")
 
 
 # --- MidiTakePlayer --------------------------------------------------------
@@ -206,7 +241,7 @@ def test_live_session_arm_records_into_current_bank():
     check("starts unarmed on bank 0 (bank 1)", not session.armed and session.current_bank == 0)
     session.arm()
     check("armed after arm()", session.armed)
-    t0 = session._recorder._start_time
+    t0 = session._recorder._armed_at
     session.ingest([{"t": t0 + 0.05, "kind": "note_on", "note": 60, "velocity": 100}])
     result = session.disarm()
     check("disarm() returns the finalized (bank, take) when something was recorded",
@@ -215,10 +250,43 @@ def test_live_session_arm_records_into_current_bank():
     check("disarmed after disarm()", not session.armed)
 
 
+def test_live_session_arm_with_bank_index_primes_the_target_bank():
+    """Regression test: arm() must let the caller override which bank
+    the very first captured note is attributed to. Without this, a
+    stale current_bank (left over from an earlier set_active_bank()
+    call - e.g. a manual bank-button click made minutes before) would
+    silently attribute freshly-armed notes to the wrong bank until the
+    next set_active_bank() call happened to correct it - exactly what
+    happened with chain-mode playback, which always starts at bank 0
+    regardless of which bank was last manually selected."""
+    session = LiveRecordSession()
+    session.set_active_bank(5)  # simulate an earlier manual bank click, unrelated to this arm
+    check("current_bank reflects the stale manual selection before arming", session.current_bank == 5)
+
+    session.arm(bank_index=0)  # e.g. chain playback just started fresh at bank 0
+    check("arm(bank_index=0) immediately overrides the stale current_bank", session.current_bank == 0)
+
+    t0 = session._recorder._armed_at
+    session.ingest([{"t": t0 + 0.02, "kind": "note_on", "note": 61, "velocity": 100}])
+    result = session.disarm()
+    check("the note captured right after a primed arm() is attributed to the primed bank, not the stale one",
+          result is not None and result[0] == 0, f"got {result}")
+
+
+def test_live_session_arm_without_bank_index_keeps_current_bank_unchanged():
+    """arm() with no argument (the plain "just arm on whatever bank is
+    currently selected" case) must behave exactly as before this fix -
+    current_bank untouched."""
+    session = LiveRecordSession()
+    session.set_active_bank(3)
+    session.arm()
+    check("arm() with no bank_index leaves current_bank exactly as it was", session.current_bank == 3)
+
+
 def test_live_session_bank_switch_while_armed_retargets_and_finalizes():
     session = LiveRecordSession()
     session.arm()
-    t0 = session._recorder._start_time
+    t0 = session._recorder._armed_at
     session.ingest([{"t": t0 + 0.05, "kind": "note_on", "note": 48, "velocity": 100}])
 
     result = session.set_active_bank(2)
@@ -227,11 +295,40 @@ def test_live_session_bank_switch_while_armed_retargets_and_finalizes():
     check("current_bank updates to the new bank", session.current_bank == 2)
     check("still armed after a bank switch - recording keeps going, just retargeted", session.armed)
 
-    t1 = session._recorder._start_time
+    t1 = session._recorder._armed_at
     session.ingest([{"t": t1 + 0.05, "kind": "note_on", "note": 55, "velocity": 90}])
     result2 = session.disarm()
     check("the segment captured after switching belongs to the new bank",
           result2 is not None and result2[0] == 2 and result2[1].note_on_count() == 1, f"got {result2}")
+
+
+def test_live_session_bank_switch_captures_a_note_logged_right_at_the_transition():
+    """The chain-mode regression this fix targets end to end: a note
+    logged essentially *at* the moment of a bank switch (e.g. the new
+    bank's own first pattern step, fired by the player thread right as
+    the transition happens) must land in the NEW bank's segment, not
+    get silently dropped because set_active_bank()'s start() picked
+    "now" as this segment's start and that note's timestamp was a
+    hair earlier."""
+    session = LiveRecordSession()
+    session.arm()
+    result = session.set_active_bank(1)
+    check("test setup: switching from bank 0 with nothing captured returns None", result is None)
+    # The carried-forward dedup cursor after the switch - in production
+    # this is where set_active_bank() left it (unchanged, since nothing
+    # was captured on bank 0). Constructing the event's timestamp
+    # relative to *this*, not to wall-clock "now", is what deterministically
+    # exercises the bug regardless of how much real time this test itself
+    # takes to run between arm() and here: a note whose timestamp only
+    # just clears the carried cursor - the same situation as the new
+    # bank's own first pattern step firing right at the transition -
+    # must still be captured, not dropped because start() would (before
+    # this fix) have picked a *later* time.time() as this segment's t=0.
+    carried_cursor = session._recorder._last_seen_ts
+    session.ingest([{"t": carried_cursor + 0.001, "kind": "note_on", "note": 60, "velocity": 100}])
+    result2 = session.disarm()
+    check("a note timestamped right at (just after) the switch is still captured for the new bank",
+          result2 is not None and result2[0] == 1 and result2[1].note_on_count() == 1, f"got {result2}")
 
 
 def test_live_session_switching_to_a_bank_with_no_new_notes_reports_nothing():
@@ -254,7 +351,7 @@ def test_live_session_switching_to_a_bank_with_no_new_notes_reports_nothing():
 def test_live_session_set_active_bank_to_same_bank_is_a_no_op():
     session = LiveRecordSession()
     session.arm()
-    t0 = session._recorder._start_time
+    t0 = session._recorder._armed_at
     session.ingest([{"t": t0 + 0.02, "kind": "note_on", "note": 60, "velocity": 100}])
     result = session.set_active_bank(0)  # already on bank 0
     check("selecting the already-active bank does not finalize/reset anything",
@@ -399,6 +496,7 @@ def main():
     test_recorder_never_double_ingests_the_same_event()
     test_recorder_stop_resets_for_a_fresh_recording()
     test_elapsed_reports_zero_when_not_recording()
+    test_recorder_captures_an_event_logged_before_start_was_called()
 
     test_player_replays_take_with_correct_order_and_pairing()
     test_player_stop_mid_playback_releases_held_notes()
@@ -408,7 +506,10 @@ def main():
     test_player_loop_false_default_still_plays_once_and_stops()
 
     test_live_session_arm_records_into_current_bank()
+    test_live_session_arm_with_bank_index_primes_the_target_bank()
+    test_live_session_arm_without_bank_index_keeps_current_bank_unchanged()
     test_live_session_bank_switch_while_armed_retargets_and_finalizes()
+    test_live_session_bank_switch_captures_a_note_logged_right_at_the_transition()
     test_live_session_switching_to_a_bank_with_no_new_notes_reports_nothing()
     test_live_session_set_active_bank_to_same_bank_is_a_no_op()
     test_live_session_default_bank_is_zero()

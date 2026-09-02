@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 midi_link.py - shared serial-MIDI-log parsing for YoungPiongMidi's
-host-side Python tools (tools/acid_synth_monitor.py, tools/synth_studio.py).
+host-side Python tools (tools/acid_synth_monitor.py, tools/groovebox.py).
 
 The board has no wire MIDI transport yet (BLE/UART are Milestones 8-9 -
 see docs/midi.md), so every host tool that reacts to MIDI events reads
@@ -10,7 +10,6 @@ over the serial console (components/midi/midi.c's log_event()). This
 module exists so that parsing format and port autodetection live in
 exactly one place instead of being copy-pasted between tools.
 """
-import glob
 import re
 
 LOG_NOTE_ON = re.compile(r"NOTE_ON\s+ch=(\d+)\s+note=(\d+)\s+vel=(\d+)")
@@ -18,6 +17,16 @@ LOG_NOTE_OFF = re.compile(r"NOTE_OFF\s+ch=(\d+)\s+note=(\d+)\s+vel=(\d+)")
 LOG_CC = re.compile(r"CC\s+ch=(\d+)\s+cc=(\d+)\s+val=(\d+)")
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+# Espressif's registered USB vendor ID - this board's native USB-Serial/
+# JTAG interface enumerates under it (confirmed directly via pyserial's
+# own port listing on the actual connected board: VID 0x303A, PID
+# 0x1001, description "USB JTAG/serial debug unit", manufacturer
+# "Espressif" - not guessed). Used to actually *recognize* the ESP32
+# among whatever other serial devices happen to be attached, rather
+# than assuming "the first port found" or matching a macOS-specific
+# device name pattern.
+ESPRESSIF_USB_VID = 0x303A
 
 
 def note_label(note: int) -> str:
@@ -28,12 +37,39 @@ def midi_note_to_freq(note: int) -> float:
     return 440.0 * (2.0 ** ((note - 69) / 12.0))
 
 
+def list_serial_ports():
+    """Returns every detected serial port as (device, label, is_esp32)
+    tuples, using pyserial's own cross-platform port enumeration (not a
+    glob pattern - works regardless of OS/naming scheme, and surfaces a
+    real description/manufacturer string instead of a bare device path).
+    `is_esp32` is True when the port's USB VID matches
+    ESPRESSIF_USB_VID - this is what "recognizing the ESP32" actually
+    means here, not just guessing from the device name."""
+    import serial.tools.list_ports
+    ports = []
+    for p in serial.tools.list_ports.comports():
+        is_esp32 = p.vid == ESPRESSIF_USB_VID
+        desc = p.description if p.description and p.description != "n/a" else None
+        label = f"{p.device} ({desc})" if desc else p.device
+        ports.append((p.device, label, is_esp32))
+    return ports
+
+
 def find_default_port():
-    """Returns the first /dev/cu.usbmodem* port, or None if none is
-    attached - callers decide how to handle "no hardware found" (exit
-    with an error, or fall back to a self-test mode)."""
-    candidates = sorted(glob.glob("/dev/cu.usbmodem*"))
-    return candidates[0] if candidates else None
+    """Auto-detects the board's serial port: prefers a port whose USB
+    VID matches Espressif's (an actual hardware identification, not
+    just "the first port found" or a device-name guess), falling back
+    to the first serial port at all if no Espressif-VID match exists
+    (e.g. a different board). Returns None if nothing is connected -
+    callers decide how to handle that (exit with an error, or fall back
+    to a self-test/Demo mode)."""
+    ports = list_serial_ports()
+    if not ports:
+        return None
+    for device, _label, is_esp32 in ports:
+        if is_esp32:
+            return device
+    return ports[0][0]
 
 
 def serial_reader_thread(port, baud, on_note_on, on_note_off, on_cc, stop_event,

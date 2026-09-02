@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 midi_recorder.py - real-time MIDI performance recorder for Young Piong
-Synth Studio (tools/synth_studio.py). Captures incoming note_on/
+Groovebox (tools/groovebox.py). Captures incoming note_on/
 note_off events with their actual real-time timing while armed - a
 genuine MIDI recording (a "take"), not audio - then can play it back
 through the exact recorded timing and save it as a standard MIDI file
@@ -17,7 +17,7 @@ MidiRecorder is deliberately NOT threaded or lock-protected, unlike
 SequencerPlayer/the rest of this app's cross-thread state: it is always
 driven from the Tk main thread's own ~30Hz redraw tick, fed the same
 already-ordered `SynthEngine.event_log` snapshot the piano-roll and MIDI
-log already read (see synth_studio.py's _tick()) - there is no
+log already read (see groovebox.py's _tick()) - there is no
 producer/consumer split here to guard, and reusing that single source of
 truth means a recording captures a note regardless of where it came from
 (the board, the sequencer, Demo mode, the Test Note button) with zero
@@ -50,13 +50,37 @@ class MidiRecorder:
     def __init__(self):
         self.active = False
         self._events = []
-        self._start_time = None
+        self._start_time = None   # lazy - see start()'s docstring for why
+        self._armed_at = None     # wall-clock time.time() at start() - for elapsed() display only
         self._last_seen_ts = 0.0
 
-    def start(self):
+    def start(self, last_seen_ts: float = None):
+        """`last_seen_ts`, if given, overrides the dedup cursor's
+        starting point instead of defaulting to time.time() - used by
+        LiveRecordSession to carry the stream position forward across a
+        bank switch rather than resetting to "now" (see its own
+        set_active_bank() comment for why "now" would risk silently
+        dropping an event that already happened moments earlier but
+        hasn't reached ingest() yet this tick). The default (time.time())
+        is correct for a brand new session (a plain arm()), so stale
+        events already sitting in the last-100 event-log window from
+        long before this session don't get resurrected.
+
+        `_start_time` (the relative-time-zero baseline every captured
+        event's offset is measured from) is deliberately NOT set here at
+        all - see ingest(): it's set lazily, to the actual timestamp of
+        the first event this segment ends up capturing. Setting it
+        eagerly to time.time() here caused exactly this class of bug:
+        a background thread (the sequencer's own pattern, or the board)
+        can log an event microseconds before this call actually runs,
+        which would then look like it happened *before* this segment
+        started (a negative relative time) and get silently dropped -
+        a real, observed bug (a bank's own first note vanishing right
+        after a chain-mode transition, or Record's very first note)."""
         self._events = []
-        self._start_time = time.time()
-        self._last_seen_ts = self._start_time
+        self._start_time = None
+        self._armed_at = time.time()
+        self._last_seen_ts = last_seen_ts if last_seen_ts is not None else time.time()
         self.active = True
 
     def ingest(self, events):
@@ -76,16 +100,18 @@ class MidiRecorder:
             self._last_seen_ts = e["t"]
             if e["kind"] not in ("note_on", "note_off"):
                 continue
+            if self._start_time is None:
+                self._start_time = e["t"]  # this segment's first captured event defines its own t=0
             rel_t = e["t"] - self._start_time
             if rel_t < 0:
-                continue  # an event timestamped before start() (shouldn't happen; defensive)
+                continue  # can't happen now that _start_time is lazy - kept as a defensive guard
             velocity = e.get("velocity", 0)
             self._events.append((rel_t, e["kind"], e["note"], velocity))
 
     def elapsed(self) -> float:
-        if not self.active or self._start_time is None:
+        if not self.active or self._armed_at is None:
             return 0.0
-        return time.time() - self._start_time
+        return time.time() - self._armed_at
 
     def stop(self) -> MidiTake:
         self.active = False
@@ -108,7 +134,7 @@ class LiveRecordSession:
     actually captured at least one note. Switching to (or re-arming on)
     a bank that already holds a take, then switching away again without
     having played anything, leaves that take completely untouched -
-    "il ne supprime pas sauf si je joue un son." The caller (synth_studio.py)
+    "il ne supprime pas sauf si je joue un son." The caller (groovebox.py)
     is the one that actually writes into `self.takes[bank]`; this class
     only ever *offers* a finalized (bank, MidiTake) pair when there's
     something genuinely new to store, and returns None otherwise -
@@ -133,13 +159,33 @@ class LiveRecordSession:
             return None
         finished = None
         if self.armed:
+            # Carry the dedup cursor forward from wherever the just-
+            # finalized segment's ingest() calls had actually reached -
+            # NOT time.time() ("now") - see MidiRecorder.start()'s
+            # docstring for why "now" can be later than an event the new
+            # bank already logged (its own very first note, fired by the
+            # player thread right at the transition) and silently drop it.
+            carried_cursor = self._recorder._last_seen_ts
             finished = self._finalize_if_nonempty()
-            self._recorder.start()  # keep capturing, now for the new bank
+            self._recorder.start(last_seen_ts=carried_cursor)  # keep capturing, now for the new bank
         self.current_bank = bank_index
         return finished
 
-    def arm(self):
+    def arm(self, bank_index: int = None):
+        """`bank_index`, if given, primes which bank the very first
+        captured note gets attributed to - without it, arming keeps
+        whatever `current_bank` was left over from the last
+        set_active_bank() call, which is very often stale (e.g. a
+        manual bank-button click made minutes earlier) and not actually
+        where playback is starting from right now. This matters
+        specifically for chain-mode playback: a fresh Play/Record always
+        starts the chain at bank 0 regardless of which bank was last
+        selected, so the caller passes that in explicitly rather than
+        this class guessing or the caller reaching in to poke
+        current_bank directly."""
         self.armed = True
+        if bank_index is not None:
+            self.current_bank = bank_index
         self._recorder.start()
 
     def disarm(self):
@@ -192,7 +238,7 @@ class MidiTakePlayer:
         """`loop=True` repeats the take indefinitely (jumping back to
         t=0 after the last event) until stop() is called - used for the
         "it must repeat automatically" live-looper behavior in
-        synth_studio.py. Default is a single pass, matching a plain
+        groovebox.py. Default is a single pass, matching a plain
         "play this once" expectation for any other caller."""
         if take.is_empty():
             return

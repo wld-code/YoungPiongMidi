@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
 """
-synth_studio.py - Young Piong Synth Studio: a real-time Python GUI
-synthesizer that connects to the board over the same serial MIDI log
+groovebox.py - Young Piong Groovebox: a real-time Python GUI groovebox
+that connects to the board over the same serial MIDI log
 tools/acid_synth_monitor.py reads (see docs/midi.md - BLE/UART wire
-transports are Milestones 8-9, so this log is still the only "transport"
-that exists), plays it through a 10-instrument polyphonic synth engine
-(synth_instruments.py), and shows the incoming audio waveform, MIDI
-event log, and a scrolling piano-roll of the melody the board generates
-- all live. Also includes a built-in 8-bank x 16-step sequencer
-(sequencer.py), and each of those same 8 banks can additionally hold a
-live-recorded MIDI take (midi_recorder.py) - a real-time capture of
-whatever notes actually happened (from the board, the sequencer, or
-Demo mode), played back at its original timing and exportable as a
-standard .mid file.
+transports are Milestones 8-9, so this log is still the only
+"transport" that exists), plays it through a 10-instrument polyphonic
+synth engine (synth_instruments.py), and shows the incoming audio
+waveform, MIDI event log, and a scrolling piano-roll of the melody the
+board generates - all live. Also includes a built-in 8-bank x 16-step
+sequencer with automatic bank chaining (sequencer.py) - select a bank
+while the pattern plays to extend the loop from bank 1 through it,
+turning single-pattern looping into a multi-bank "song" - and each of
+those same 8 banks can additionally hold a live-recorded MIDI take
+(midi_recorder.py): a real-time capture of whatever notes actually
+happened (from the board, the sequencer, or Demo mode), played back at
+its original timing and exportable as a standard .mid file. Also
+writes what you sing/play straight into the step grid itself in real
+time, quantized to whichever step is currently playing.
 
 Quick start:
     pip install pyserial numpy sounddevice
-    python3 tools/synth_studio.py
-(plug the board in first; if no /dev/cu.usbmodem* port is found, the app
-still opens in Demo mode - click "Start Demo" to hear the synth engine
-play a fixed riff with no hardware attached.)
+    python3 tools/groovebox.py
+(plug the board in first - the serial port is auto-detected by
+recognizing the ESP32's own USB vendor ID, with a dropdown to pick a
+different one if needed; if nothing is found, the app still opens in
+Demo mode - click "Start Demo" to hear the synth engine play a fixed
+riff with no hardware attached.)
 
 Architecture (why threads are split this way):
     - serial-reader thread (midi_link.serial_reader_thread): parses the
@@ -55,7 +61,7 @@ from collections import deque
 
 import numpy as np
 
-from midi_link import find_default_port, note_label, serial_reader_thread
+from midi_link import find_default_port, list_serial_ports, note_label, serial_reader_thread
 from synth_instruments import SynthEngine, INSTRUMENTS
 from sequencer import (SequencerModel, SequencerPlayer, StepRecorder, step_duration_seconds,
                         NUM_BANKS, NUM_STEPS, MIN_BPM, MAX_BPM, DEFAULT_BPM)
@@ -138,7 +144,7 @@ class NoteHistory:
                     span["end"] = e["t"]
 
 
-class SynthStudioApp:
+class GrooveboxApp:
     def __init__(self, root, port, baud, device, demo_only=False, auto_close_after=None):
         self.root = root
         self.engine = SynthEngine(SAMPLE_RATE)
@@ -164,6 +170,10 @@ class SynthStudioApp:
         self._seq_playhead = -1  # written from the player thread, read from the Tk thread each
                                   # tick - a single int assignment, same reasoning as elsewhere
                                   # in this file for why that's safe without a lock
+        self._last_chain_bank_seen = -1  # last bank the Tk thread has reacted to (retargeted
+                                          # recording for, redrawn) - polled from seq_player.current_bank
+                                          # each tick; kept separate from seq_model.active_bank itself
+                                          # since the PLAYER thread writes that one directly
 
         # One recorded MIDI take slot per bank (parallel to seq_model's
         # one step-pattern per bank). While armed, recording always
@@ -210,14 +220,14 @@ class SynthStudioApp:
 
     # --- UI construction -------------------------------------------------
     def _build_ui(self):
-        self.root.title("Young Piong Synth Studio")
+        self.root.title("Young Piong Groovebox")
         self.root.configure(bg=BG)
         self.root.geometry("1040x980")
         self.root.minsize(860, 760)
 
         header = tk.Frame(self.root, bg=BG)
         header.pack(fill="x", padx=16, pady=(14, 6))
-        tk.Label(header, text="Young Piong Synth Studio", bg=BG, fg=FG,
+        tk.Label(header, text="Young Piong Groovebox", bg=BG, fg=FG,
                   font=("Helvetica", 18, "bold")).pack(side="left")
         status_col = tk.Frame(header, bg=BG)
         status_col.pack(side="right")
@@ -317,6 +327,13 @@ class SynthStudioApp:
         tk.Button(controls, text="Reconnect", command=self.reconnect,
                   bg=PANEL_BG, fg=FG, relief="flat", font=("Helvetica", 10), padx=6, pady=8
                   ).pack(fill="x", pady=4)
+
+        tk.Label(controls, text="Serial port", bg=BG, fg=MUTED_FG,
+                  font=("Helvetica", 9)).pack(anchor="w", pady=(10, 0))
+        self.port_choice = ttk.Combobox(controls, state="readonly", font=("Helvetica", 9))
+        self.port_choice.pack(fill="x", pady=(2, 4))
+        self.port_choice.bind("<<ComboboxSelected>>", self._on_port_chosen)
+        self._populate_serial_ports()
 
         tk.Label(controls, text="Output device", bg=BG, fg=MUTED_FG,
                   font=("Helvetica", 9)).pack(anchor="w", pady=(10, 0))
@@ -503,22 +520,29 @@ class SynthStudioApp:
             self.seq_player.start()
             self.seq_play_btn.configure(text="■ Stop")
 
-    def _ensure_pattern_playing(self):
+    def _ensure_pattern_playing(self) -> bool:
         """Starts the step sequencer if it isn't already running - Record
         and Play take both call this first, so pressing either actually
         has something being generated to capture/loop instead of
         silently capturing silence because the pattern was never
         started separately. Never stops it - Record/Play take finishing
         doesn't interrupt a groove the user may still want running;
-        that's still Play pattern/Stop's own job. Since SequencerPlayer
-        already re-reads the active bank's steps every single step (see
-        sequencer.py), a running pattern automatically follows the same
-        bank switches LiveRecordSession is already following while
-        armed - no extra sync code needed for that part, they're both
-        already reading the one shared self.seq_model.active_bank."""
+        that's still Play pattern/Stop's own job.
+
+        Returns True if this call actually started the pattern fresh -
+        callers that need to know which bank playback begins on (Record
+        arming LiveRecordSession) use this rather than reading
+        seq_player.current_bank directly right after start(): the new
+        background thread hasn't necessarily run its first line yet, so
+        current_bank could still read its pre-start -1 for a brief
+        window. A fresh start is *always* bank 0 by SequencerPlayer's
+        own contract (see sequencer.py), so a True return means the
+        caller can use bank 0 unconditionally, race-free."""
         if not self.seq_player.playing:
             self.seq_player.start()
             self.seq_play_btn.configure(text="■ Stop")
+            return True
+        return False
 
     def _on_seq_step(self, step_index):
         # Called from SequencerPlayer's own background thread - must
@@ -544,16 +568,50 @@ class SynthStudioApp:
         self.seq_note_label_var.set(note_label(n))
 
     def _on_bank_select(self, bank_index):
-        # If armed, this both finalizes whatever was captured for the
-        # bank being left (only if non-empty - see LiveRecordSession)
-        # and retargets recording to the new bank, all in one call.
+        # Clicking a bank button both selects it for display/editing AND
+        # sets the chain loop's end point to it (seq_model.select_bank())
+        # - see sequencer.py's SequencerModel.select_bank() docstring.
+        # If Record is armed, this also finalizes whatever was captured
+        # for the bank being left (only if non-empty - see
+        # LiveRecordSession) and retargets recording to the new bank,
+        # all in one call.
         finished = self.live_record.set_active_bank(bank_index)
         if finished is not None:
             bank, take = finished
             self.takes[bank] = take
         self.seq_model.select_bank(bank_index)
+        self._last_chain_bank_seen = bank_index  # keep _follow_chain_bank()'s
+                                                   # cursor in sync too - harmless
+                                                   # either way since set_active_bank()
+                                                   # is itself idempotent, but avoids
+                                                   # a redundant call next tick
         self._redraw_seq_bank_buttons()
         self._redraw_seq_steps()
+        self._update_record_status_label()
+
+    def _follow_chain_bank(self):
+        """Polled every tick (Tk thread): when the sequencer's chain
+        playback has moved to a different bank (SequencerPlayer already
+        writes model.active_bank directly, and StepRecorder already
+        reads that on every ingest() - see their own docstrings for why
+        neither of those needs anything from here), this is the one
+        remaining piece that doesn't already "just work": telling
+        LiveRecordSession about the change, since unlike StepRecorder it
+        tracks its own current_bank and has to be explicitly informed.
+        Only reacts while the pattern is actually playing - current_bank
+        is -1 otherwise, and a stale one right after Stop must not be
+        treated as a new bank change."""
+        if not self.seq_player.playing:
+            return
+        chain_bank = self.seq_player.current_bank
+        if chain_bank < 0 or chain_bank == self._last_chain_bank_seen:
+            return
+        self._last_chain_bank_seen = chain_bank
+        finished = self.live_record.set_active_bank(chain_bank)
+        if finished is not None:
+            bank, take = finished
+            self.takes[bank] = take
+        self._redraw_seq_bank_buttons()
         self._update_record_status_label()
 
     def _on_step_click(self, step_index):
@@ -574,9 +632,19 @@ class SynthStudioApp:
 
     def _redraw_seq_bank_buttons(self):
         active = self.seq_model.active_bank
+        chain_end = self.seq_model.chain_end_bank
         for i, btn in enumerate(self.seq_bank_buttons):
-            btn.configure(bg=ACCENT if i == active else PANEL_BG,
-                          fg="#04121f" if i == active else FG)
+            if i == active:
+                bg, fg = ACCENT, "#04121f"
+            elif i <= chain_end:
+                # In the chain's loop range (banks 1..chain_end+1) but
+                # not the one currently sounding/edited - a subtler
+                # highlight than the active bank's, so the loop's actual
+                # extent is visible at a glance.
+                bg, fg = "#2a3550", FG
+            else:
+                bg, fg = PANEL_BG, FG
+            btn.configure(bg=bg, fg=fg)
 
     def _redraw_seq_steps(self):
         steps = self.seq_model.active_steps()
@@ -614,9 +682,17 @@ class SynthStudioApp:
                 self.takes[bank] = take
             self._update_record_status_label()
         else:
-            self._ensure_pattern_playing()
-            self.live_record.arm()
+            just_started = self._ensure_pattern_playing()
+            if just_started:
+                start_bank = 0  # SequencerPlayer's chain always starts at bank 0 - deterministic,
+                                 # race-free (current_bank might not have updated yet this instant)
+            else:
+                start_bank = self.seq_player.current_bank
+                if start_bank < 0:  # defensive: pattern reported playing=False->True but hasn't
+                    start_bank = self.seq_model.active_bank  # set current_bank yet somehow
+            self.live_record.arm(bank_index=start_bank)
             self.step_recorder.arm()
+            self._last_chain_bank_seen = start_bank
             self.record_btn.configure(text="■ Stop Rec", bg="#ff5f5f", fg="#04121f")
             self.record_status_var.set(f"Bank {self.live_record.current_bank + 1}: recording...")
 
@@ -666,11 +742,33 @@ class SynthStudioApp:
         self.take_save_btn.configure(state="normal" if can_act else "disabled")
 
     def reconnect(self):
+        self._populate_serial_ports()  # refresh in case a port was plugged/unplugged
         port = find_default_port()
         if port is None:
-            self._set_status("Reconnect failed: no /dev/cu.usbmodem* port found")
+            self._set_status("Reconnect failed: no serial port found - plug the board in")
             return
         self._connect_serial(port, 115200)
+
+    def _populate_serial_ports(self, select_device=None):
+        """(Re)fills the serial-port dropdown, auto-selecting `select_device`
+        if given, else whichever port find_default_port() would pick
+        (an Espressif-VID match if one exists - see midi_link.py)."""
+        ports = list_serial_ports()
+        self._serial_port_devices = [device for device, _label, _esp in ports]
+        self.port_choice["values"] = [label for _device, label, _esp in ports]
+        target = select_device if select_device is not None else find_default_port()
+        if target in self._serial_port_devices:
+            self.port_choice.current(self._serial_port_devices.index(target))
+        elif self._serial_port_devices:
+            self.port_choice.current(0)
+        else:
+            self.port_choice.set("")
+
+    def _on_port_chosen(self, event):
+        del event
+        idx = self.port_choice.current()
+        if 0 <= idx < len(self._serial_port_devices):
+            self._connect_serial(self._serial_port_devices[idx], 115200)
 
     def _connect_serial(self, port, baud):
         if port is None:
@@ -679,8 +777,21 @@ class SynthStudioApp:
             self._set_status("No board found - plug it in and click Reconnect, or Start Demo")
             return
 
+        # A fresh stop Event per connection attempt, deliberately
+        # separate from self.stop_event (the whole-app shutdown signal -
+        # switching ports must not also stop Demo mode or the redraw
+        # tick). Signal any previous connection's reader thread to stop
+        # first - same reasoning as SequencerPlayer/MidiTakePlayer's
+        # per-run Event: reusing one shared Event across reconnects
+        # risks a race with an old thread's in-flight readline().
+        if getattr(self, "_serial_stop_event", None) is not None:
+            self._serial_stop_event.set()
+        stop_event = threading.Event()
+        self._serial_stop_event = stop_event
+
         def on_connect(p):
             self._set_status(f"connected: {p} @ {baud}")
+            self._populate_serial_ports(select_device=p)
 
         def on_note_on(ch, note, vel):
             del ch
@@ -699,7 +810,7 @@ class SynthStudioApp:
 
         threading.Thread(
             target=serial_reader_thread,
-            args=(port, baud, on_note_on, on_note_off, on_cc, self.stop_event),
+            args=(port, baud, on_note_on, on_note_off, on_cc, stop_event),
             kwargs={"on_connect": on_connect, "on_error": on_error},
             daemon=True,
         ).start()
@@ -769,6 +880,14 @@ class SynthStudioApp:
         self._tick_count += 1
         snap = self.engine.snapshot_for_ui()
         self.note_history.ingest(snap["events"])
+        # _follow_chain_bank() must run BEFORE live_record.ingest() - if
+        # the chain crossed a bank boundary in this same ~33ms tick, this
+        # ordering makes sure live_record.current_bank already reflects
+        # the new bank before any of this tick's events (which may
+        # include that new bank's own very first note) get attributed to
+        # a bank; the other order would occasionally attribute one note
+        # to the bank being left instead of the one it actually belongs to.
+        self._follow_chain_bank()
         self.live_record.ingest(snap["events"])
         self.step_recorder.ingest(snap["events"], self.seq_player.current_step)
         self._draw_waveform()
@@ -980,6 +1099,8 @@ class SynthStudioApp:
 
     def _on_close(self):
         self.stop_event.set()
+        if getattr(self, "_serial_stop_event", None) is not None:
+            self._serial_stop_event.set()
         self.demo_running = False
         self.seq_player.stop()
         self.take_player.stop()
@@ -1012,7 +1133,7 @@ def main():
         return
 
     root = tk.Tk()
-    app = SynthStudioApp(root, args.port, args.baud, args.device,
+    app = GrooveboxApp(root, args.port, args.baud, args.device,
                           demo_only=args.demo, auto_close_after=args.smoke_test)
     del app
     root.mainloop()

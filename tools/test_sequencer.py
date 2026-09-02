@@ -164,38 +164,137 @@ def test_player_plays_correct_pattern_in_order():
     check("player.current_step resets to -1 after stop()", player.current_step == -1)
 
 
-def test_bank_switch_mid_playback_takes_effect_next_step():
+def test_default_chain_end_zero_is_exactly_the_old_single_bank_loop():
+    """chain_end_bank defaults to 0 - a fresh SequencerModel/player must
+    behave exactly like a single-bank loop forever, never touching bank
+    1 or beyond, so nothing changes for anyone who never selects a
+    further bank (this is really just re-confirming
+    test_player_plays_correct_pattern_in_order's own coverage from the
+    chain feature's point of view)."""
     m = SequencerModel()
     m.set_bpm(MAX_BPM)
-    m.toggle_step(0, 0, note=60)  # bank 0: only step 0 on
-    m.toggle_step(1, 0, note=72)  # bank 1: only step 0 on, different note
+    m.toggle_step(0, 0, note=60)
+    m.toggle_step(1, 0, note=99)  # bank 1 has content too, but must never be reached
+    banks_seen = set()
+    player = SequencerPlayer(m, lambda n, v: None, lambda n: None,
+                              on_bank_change=lambda b: banks_seen.add(b))
+    player.start()
+    time.sleep(step_duration_seconds(MAX_BPM) * NUM_STEPS * 2.5)
+    player.stop(join=True)
+    check("with chain_end_bank untouched (0), only bank 0 is ever played",
+          banks_seen == {0}, f"got {banks_seen}")
 
-    events = []
-    switched = {"done": False}
+
+def test_chain_plays_each_bank_in_order_then_wraps():
+    m = SequencerModel()
+    m.set_bpm(MAX_BPM)
+    m.toggle_step(0, 0, note=10)
+    m.toggle_step(1, 0, note=11)
+    m.toggle_step(2, 0, note=12)
+    m.select_bank(2)  # sets chain_end_bank=2 -> chain is banks 0,1,2
+
+    notes = []
+    bank_changes = []
 
     def note_on(note, vel):
         del vel
-        events.append(note)
+        notes.append(note)
 
-    def note_off(note):
-        del note
+    def on_bank_change(b):
+        bank_changes.append(b)
+        if len(bank_changes) >= 6:  # two full laps (3 banks/lap) - stop as soon as we have them
+            player.stop()
 
-    def on_step(i):
-        # Switch banks deterministically right after step 0 of the
-        # first loop fires, instead of racing a sleep against playback.
-        if i == 0 and not switched["done"]:
-            switched["done"] = True
-            m.select_bank(1)
-
-    player = SequencerPlayer(m, note_on, note_off, on_step=on_step)
+    player = SequencerPlayer(m, note_on, lambda n: None, on_bank_change=on_bank_change)
     player.start()
-    time.sleep(step_duration_seconds(MAX_BPM) * (NUM_STEPS + NUM_STEPS // 2) * 1.1)
-    player.stop(join=True)
+    # 6 bank-boundary crossings at 1.0s/bank (MAX_BPM, 16 steps) = ~6s;
+    # generous margin over that for scheduling jitter.
+    player._thread.join(timeout=9.0)
 
-    check("first loop played bank 0's note (60)", events[0] == 60 if events else False,
-          f"events={events}")
-    check("after switching mid-playback, a later loop played bank 1's note (72)",
-          72 in events[1:], f"events={events}")
+    check("bank sequence is 0,1,2,0,1,2,... (chain order, then wraps)",
+          bank_changes[:6] == [0, 1, 2, 0, 1, 2], f"got {bank_changes}")
+    # Only 5 notes, not 6: stop() fires from inside on_bank_change() the
+    # instant the 6th bank transition is recorded, which is BEFORE that
+    # bank's own step 0 (and therefore its note_on) has actually played
+    # - the bank-change sequence above already proves the 6th transition
+    # happened correctly; this proves the first 5 notes fired in the
+    # right order across one full lap plus most of a second.
+    check("each bank's own note fired in chain order, spanning into a second lap",
+          notes[:5] == [10, 11, 12, 10, 11], f"got {notes}")
+
+
+def test_chain_current_bank_and_model_active_bank_track_playback():
+    m = SequencerModel()
+    m.set_bpm(MAX_BPM)
+    m.select_bank(1)  # chain = banks 0,1
+
+    seen_current_bank_during_bank1 = {"seen": False}
+
+    def on_bank_change(b):
+        if b == 1:
+            # current_bank and model.active_bank must both already
+            # reflect the new bank by the time this callback fires.
+            seen_current_bank_during_bank1["seen"] = (
+                player.current_bank == 1 and m.active_bank == 1)
+            player.stop()
+
+    player = SequencerPlayer(m, lambda n, v: None, lambda n: None, on_bank_change=on_bank_change)
+    player.start()
+    check("current_bank is 0 immediately (chain always starts at bank 0)",
+          player.current_bank == 0)
+    player._thread.join(timeout=5.0)
+    check("current_bank and model.active_bank both reflect bank 1 by the time it starts playing",
+          seen_current_bank_during_bank1["seen"])
+    check("current_bank resets to -1 after stop()", player.current_bank == -1)
+
+
+def test_extending_chain_mid_playback_takes_effect_next_bank_boundary():
+    m = SequencerModel()
+    m.set_bpm(MAX_BPM)
+    # chain_end_bank starts at 0 (bank 0 only) - extend it WHILE playing.
+    m.toggle_step(2, 0, note=77)
+
+    bank_changes = []
+
+    def on_bank_change(b):
+        bank_changes.append(b)
+        if len(bank_changes) == 1:
+            # Still on bank 0's very first pass - extend the chain now,
+            # deterministically, instead of racing a sleep.
+            m.select_bank(2)  # chain_end_bank -> 2
+        if len(bank_changes) >= 3:
+            player.stop()
+
+    player = SequencerPlayer(m, lambda n, v: None, lambda n: None, on_bank_change=on_bank_change)
+    player.start()
+    player._thread.join(timeout=5.0)
+
+    check("extending the chain mid-playback is picked up by the very next bank boundary",
+          bank_changes[:3] == [0, 1, 2], f"got {bank_changes}")
+
+
+def test_shrinking_chain_mid_playback_wraps_back_into_new_range():
+    m = SequencerModel()
+    m.set_bpm(MAX_BPM)
+    m.select_bank(4)  # chain = banks 0..4
+
+    bank_changes = []
+
+    def on_bank_change(b):
+        bank_changes.append(b)
+        if len(bank_changes) == 3:  # currently on bank 2
+            m.select_bank(1)  # shrink chain to 0..1 while bank 2 is playing
+        if len(bank_changes) >= 5:
+            player.stop()
+
+    player = SequencerPlayer(m, lambda n, v: None, lambda n: None, on_bank_change=on_bank_change)
+    player.start()
+    player._thread.join(timeout=7.0)
+
+    # After shrinking to chain_end_bank=1 while bank 2 was playing, the
+    # next transition must land back inside [0,1], not bank 3.
+    check("shrinking the chain while a now-out-of-range bank plays wraps back into the new range",
+          bank_changes[:5] == [0, 1, 2, 0, 1], f"got {bank_changes}")
 
 
 def test_stop_turns_off_a_currently_held_note():
@@ -409,7 +508,11 @@ def main():
     test_model_basics()
     test_set_step_overwrite_semantics()
     test_player_plays_correct_pattern_in_order()
-    test_bank_switch_mid_playback_takes_effect_next_step()
+    test_default_chain_end_zero_is_exactly_the_old_single_bank_loop()
+    test_chain_plays_each_bank_in_order_then_wraps()
+    test_chain_current_bank_and_model_active_bank_track_playback()
+    test_extending_chain_mid_playback_takes_effect_next_bank_boundary()
+    test_shrinking_chain_mid_playback_wraps_back_into_new_range()
     test_stop_turns_off_a_currently_held_note()
     test_rapid_stop_then_start_does_not_silently_no_op()
     test_restart_while_previous_thread_still_alive_leaves_no_orphan()

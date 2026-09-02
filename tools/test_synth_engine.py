@@ -3,7 +3,7 @@
 test_synth_engine.py - headless correctness/stability tests for
 synth_instruments.SynthEngine.
 
-Why this exists and runs the way it does: tools/synth_studio.py opens a
+Why this exists and runs the way it does: tools/groovebox.py opens a
 GUI window, which cannot be visually inspected by an automated agent.
 What CAN be verified without a display is the thing that actually
 matters for "does this work" - the audio engine underneath it never

@@ -54,7 +54,7 @@ whichever transport(s) are enabled (`YP_MIDI_BLE_ENABLED`,
   `midi_task` always does one real thing with every event regardless:
   logs it (`midi.c`'s `log_event()` - e.g. `NOTE_ON  ch=0 note=69
   vel=84`) - this, not the board's own speaker, is what every PC-side
-  tool (`tools/acid_synth_monitor.py`, `tools/synth_studio.py`) actually
+  tool (`tools/acid_synth_monitor.py`, `tools/groovebox.py`) actually
   reads, and it is unconditional, unaffected by anything below.
 - **onboard_synth** (not a spec milestone - a bring-up/verification aid,
   **disabled by default** - `YP_ONBOARD_SYNTH_ENABLED` in `yp_config.h`
@@ -75,7 +75,7 @@ whichever transport(s) are enabled (`YP_MIDI_BLE_ENABLED`,
   enough for the mic to pick the output back up can create an audio
   feedback loop (the synth's own note re-triggering a new detection) -
   this, on top of most users preferring one clean output (the PC-side
-  Young Piong Synth Studio, with its 10 instruments and sequencer) over
+  Young Piong Groovebox, with its 10 instruments and sequencer) over
   a second, simpler one on the board itself, is why it now defaults off.
   Flip `YP_ONBOARD_SYNTH_ENABLED` to 1 to get board-native sound back;
   when 0, `onboard_synth_init()` is never called at all (in `main.c`) and

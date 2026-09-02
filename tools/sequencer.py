@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-sequencer.py - pure-logic step sequencer model for Young Piong Synth
-Studio (tools/synth_studio.py): 8 banks ("patterns") of 16 steps each,
-tempo-driven.
+sequencer.py - pure-logic step sequencer model for Young Piong
+Groovebox (tools/groovebox.py): 8 banks ("patterns") of 16 steps each,
+tempo-driven, chainable into a multi-bank loop.
 
 Deliberately has zero Tkinter/audio dependency - the timing math and
 bank/step data model are the part that actually needs to be *correct*
@@ -10,7 +10,7 @@ bank/step data model are the part that actually needs to be *correct*
 real, silent bug), and that correctness can be fully unit-tested without
 opening a window or a display - see tools/test_sequencer.py. Everything
 Tk-specific (drawing the step grid, wiring clicks) lives in
-synth_studio.py and only ever calls into this module.
+groovebox.py and only ever calls into this module.
 """
 import threading
 import time
@@ -70,14 +70,28 @@ class SequencerModel:
     def __init__(self):
         self.banks = [[Step() for _ in range(NUM_STEPS)] for _ in range(NUM_BANKS)]
         self.active_bank = 0
+        # The bank chain/loop range is always bank 0 through chain_end_bank
+        # inclusive - selecting a bank (below) sets both which bank is
+        # displayed/edited AND how far the automatic chain loop extends,
+        # so chain_end_bank == 0 (its default) means "just loop bank 1
+        # alone", matching the pre-chain-mode default exactly.
+        self.chain_end_bank = 0
         self.bpm = DEFAULT_BPM
 
     def set_bpm(self, bpm):
         self.bpm = clamp_bpm(bpm)
 
     def select_bank(self, index: int):
+        """Selects which bank is displayed/edited AND sets the chain
+        loop's end point to that same bank - the two are deliberately
+        the same action (not two separate concepts/calls): clicking
+        bank 1 collapses the chain back to a single-bank loop, clicking
+        bank 4 extends (or shrinks, if it was already further) the loop
+        to banks 1-4. See SequencerPlayer for how the chain actually
+        advances during playback."""
         if 0 <= index < NUM_BANKS:
             self.active_bank = index
+            self.chain_end_bank = index
 
     def toggle_step(self, bank_index: int, step_index: int, note: int) -> Step:
         """Off -> on (with `note`, accent cleared); on -> off. Returns
@@ -119,29 +133,49 @@ class SequencerModel:
 
 
 class SequencerPlayer:
-    """Drives playback of a SequencerModel's *currently active* bank in
-    a background thread, calling note_on(note, velocity)/note_off(note)
+    """Drives playback of a SequencerModel's bank *chain* in a
+    background thread, calling note_on(note, velocity)/note_off(note)
     at each step boundary. Decoupled from any specific synth engine or
-    GUI on purpose - note_on/note_off/on_step are plain callables, so
-    tests can pass list-appending fakes instead of a real audio engine
-    (see tools/test_sequencer.py) and the GUI just passes
+    GUI on purpose - note_on/note_off/on_step/on_bank_change are plain
+    callables, so tests can pass list-appending fakes instead of a real
+    audio engine (see tools/test_sequencer.py) and the GUI just passes
     SynthEngine.note_on/note_off directly (which already logs the event
     for the piano-roll/MIDI log - no separate wiring needed there).
 
-    Bank switches mid-playback take effect at the *next* step boundary
-    (active_steps() is re-read every iteration) rather than either
-    ignoring the switch or corrupting an in-flight step - this matches
-    how a real hardware sequencer's pattern-change behaves.
+    The chain: playback always starts at bank 0 and plays each bank's
+    full 16 steps in order up through model.chain_end_bank, then wraps
+    back to bank 0 - with chain_end_bank at its default of 0, that's
+    just "loop bank 1 forever", identical to this class's original,
+    single-bank-only behavior, so nothing changes for anyone who never
+    selects a further bank. chain_end_bank is re-read at every bank
+    boundary (not just once at start()), so extending or shrinking the
+    chain while it's playing takes effect on the very next bank
+    transition rather than requiring a restart - the same "takes effect
+    at the next boundary, never corrupts an in-flight step" principle
+    this class already applied to steps within a single bank.
+
+    While running, `current_bank` (like `current_step`) is kept in sync
+    with which bank is actually sounding, INCLUDING writing it into
+    model.active_bank itself - callers reading the model (the step-grid
+    display, StepRecorder) automatically follow the chain as it plays
+    with no separate wiring, the same reasoning that already applied to
+    the mid-playback bank-switch case this replaces. A manual
+    model.select_bank() call from the GUI thread can race this benignly
+    (last plain-int-write wins, no corruption) - acceptable and
+    consistent with every other cross-thread value in this app.
     """
 
-    def __init__(self, model: SequencerModel, note_on, note_off, on_step=None):
+    def __init__(self, model: SequencerModel, note_on, note_off, on_step=None, on_bank_change=None):
         self.model = model
         self.note_on = note_on
         self.note_off = note_off
         self.on_step = on_step  # optional callback(step_index) after each step fires
+        self.on_bank_change = on_bank_change  # optional callback(bank_index) whenever the
+                                               # chain moves to a different bank
         self._thread = None
         self._stop_event = threading.Event()
         self.current_step = -1
+        self.current_bank = -1
         self.playing = False
 
     def start(self):
@@ -182,12 +216,16 @@ class SequencerPlayer:
 
     def _run(self, stop_event: threading.Event):
         held_note = None
+        bank = 0  # the chain always starts at bank 0/index 0
+        self.current_bank = bank
+        self.model.active_bank = bank
+        if self.on_bank_change:
+            self.on_bank_change(bank)
         try:
-            idx = 0
+            step_idx = 0
             while not stop_event.is_set():
-                steps = self.model.active_steps()
-                step = steps[idx % NUM_STEPS]
-                self.current_step = idx % NUM_STEPS
+                step = self.model.banks[bank][step_idx]
+                self.current_step = step_idx
 
                 if held_note is not None:
                     self.note_off(held_note)
@@ -213,11 +251,30 @@ class SequencerPlayer:
                 remaining = duration - gate
                 if remaining > 0 and stop_event.wait(remaining):
                     break
-                idx += 1
+                step_idx += 1
+                if step_idx >= NUM_STEPS:
+                    step_idx = 0
+                    # Re-read chain_end_bank fresh, every bank boundary -
+                    # not just once at start() - so extending/shrinking
+                    # the chain while it plays takes effect immediately
+                    # on the next transition. If a shrink has left `bank`
+                    # itself now outside the new range, restart the
+                    # chain from bank 0 rather than computing an
+                    # arbitrary modulo landing spot - simpler to predict
+                    # ("if you're now out of range, the chain restarts")
+                    # than wherever raw (bank+1) % (chain_end+1) happens
+                    # to fall.
+                    chain_end = self.model.chain_end_bank
+                    bank = bank + 1 if bank + 1 <= chain_end else 0
+                    self.current_bank = bank
+                    self.model.active_bank = bank
+                    if self.on_bank_change:
+                        self.on_bank_change(bank)
         finally:
             if held_note is not None:
                 self.note_off(held_note)
             self.current_step = -1
+            self.current_bank = -1
             self.playing = False
 
 

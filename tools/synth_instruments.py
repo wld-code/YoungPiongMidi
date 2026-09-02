@@ -2,7 +2,7 @@
 """
 synth_instruments.py - a small polyphonic synth engine with 10 selectable
 instruments, driven by MIDI note/velocity/CC11 events, for
-tools/synth_studio.py.
+tools/groovebox.py.
 
 Design notes (why it's built this way):
 
@@ -339,7 +339,7 @@ class SynthEngine:
         (defaults to "external" - the board, Demo mode, the Test Note
         button, etc. all fall under that with zero call-site changes).
         Only the sequencer's own pattern playback and take playback tag
-        themselves otherwise (synth_studio.py wires those wrapped) - so
+        themselves otherwise (groovebox.py wires those wrapped) - so
         StepRecorder (sequencer.py) can tell "someone actually played
         something" apart from "the pattern/a take is just repeating
         what's already there" and never write either of those back into

@@ -42,7 +42,7 @@ instrument. It preserves two musical properties of the voice, not just
 | | |
 |---|---|
 | ✅ **Working, on real hardware, right now** | Mic → pitch → MIDI note → velocity → CC11 → sound, entirely on-device |
-| 🔊 **You can already hear it** | Board's own speaker, `tools/acid_synth_monitor.py`, or the full Young Piong Synth Studio GUI (with a built-in sequencer) |
+| 🔊 **You can already hear it** | Board's own speaker, `tools/acid_synth_monitor.py`, or the full Young Piong Groovebox GUI (10-instrument synth + chainable sequencer) |
 | 🧪 **996 host-side test checks** | No board required - `cd test && make` |
 | 🚧 **Not yet implemented** | A wire MIDI transport (BLE/UART) and pitch bend - see [Roadmap](#-roadmap) |
 
@@ -128,12 +128,14 @@ docs/
                      principles, with diagrams
 test/               Host-side tests (real, passing - see test/README.md)
 tools/              acid_synth_monitor.py - real-time audio monitor
-                    synth_studio.py       - Young Piong Synth Studio: 10-
-                                             instrument GUI synth + sequencer
-                                             + live waveform/MIDI/melody view
-                    sequencer.py          - 8-bank x 16-step sequencer model
+                    groovebox.py          - Young Piong Groovebox: 10-
+                                             instrument GUI synth + chainable
+                                             sequencer + live waveform/MIDI view
+                    sequencer.py          - 8-bank x 16-step sequencer model,
+                                             bank chaining, voice step-recording
                     midi_recorder.py      - live MIDI take recorder + .mid export
-                    midi_link.py          - shared serial-MIDI-log parsing
+                    midi_link.py          - shared serial-MIDI-log parsing +
+                                             serial port auto-detection
 ```
 
 ## 🛠️ Build & flash
@@ -230,19 +232,20 @@ see [`docs/tutorials/07-audio-synthesis-pdm.md`](docs/tutorials/07-audio-synthes
 for why, including a real numerical-instability bug found (and avoided
 on-device) while building the richer Python one.
 
-## 🎹 Young Piong Synth Studio (`tools/synth_studio.py`)
+## 🎹 Young Piong Groovebox (`tools/groovebox.py`)
 
 A real-time desktop app (Tkinter, no extra GUI framework needed) that
 turns the board's serial MIDI log into a proper playable instrument on
 the computer - 10 selectable instruments, a live view of what the board
-is doing, and a built-in 8-bank x 16-step sequencer with recording:
+is doing, and a built-in 8-bank x 16-step sequencer with automatic bank
+chaining and live recording:
 
 ```sh
 pip install pyserial numpy sounddevice
-python3 tools/synth_studio.py
+python3 tools/groovebox.py
 ```
 
-![Young Piong Synth Studio layout preview](docs/img/synth_studio_preview.png)
+![Young Piong Groovebox layout preview](docs/img/groovebox_preview.png)
 
 > [!NOTE]
 > The image above is a **to-scale layout preview**, not a live
@@ -254,32 +257,45 @@ python3 tools/synth_studio.py
 > Swapping in a real screenshot is a one-line change - see the alt text
 > in `README.md`'s source.
 
+- **The serial port is auto-detected, and switchable** - `tools/midi_link.py`
+  enumerates every connected serial device and picks the one whose USB
+  vendor ID matches Espressif's (a real hardware identification -
+  `0x303A`, confirmed directly against the board rather than guessed
+  from a device-name pattern), not just "the first port found." A
+  dropdown in the app lists every detected port (with its description,
+  e.g. `USB JTAG/serial debug unit`) to switch to a different one
+  without restarting - useful with more than one serial device attached,
+  or if auto-detection ever picks the wrong one.
 - **10 instruments**, switchable live without interrupting a held note:
   Acid Bass (the same TB-303-style resonant voice as the monitor tool
   above), Sine Lead, Square Lead, Saw Pad, FM Bell, Pluck
   (Karplus-Strong string), Sub Bass, Brass, Organ, Vibraphone.
-- **An 8-bank x 16-step sequencer** (`tools/sequencer.py`): left-click a
-  step to place the currently-selected note, right-click to accent it,
-  pick which of the 8 banks is active, drag the tempo slider (40-240
-  BPM), and hit **Play pattern**/**Stop**. Switching banks mid-playback
-  takes effect on the next step boundary, like a real hardware
-  sequencer. Sequencer notes go through the exact same engine call as a
-  note from the board, so they show up in the waveform/log/piano-roll
-  for free.
+- **An 8-bank x 16-step sequencer with automatic chaining**
+  (`tools/sequencer.py`): left-click a step to place the currently-
+  selected note, right-click to accent it, drag the tempo slider
+  (40-240 BPM), and hit **Play pattern**/**Stop**. Selecting a bank both
+  displays/edits it *and* extends the loop's range: playback always
+  starts at bank 1 and plays every bank up through whichever one you
+  last selected, in order, before wrapping back to bank 1 - so clicking
+  bank 4 turns a single-pattern loop into a 4-bank "song" that repeats
+  automatically; clicking bank 1 again collapses it back to looping just
+  that one. Extending or shrinking the chain takes effect on the very
+  next bank boundary, even while it's playing.
 - **Record your voice straight into the step pattern**
   (`tools/sequencer.py`'s `StepRecorder`): while **Record** is armed,
   singing/playing (from the board, Demo mode, or Test Note - anything
-  that isn't the pattern echoing its own steps or a take replaying)
-  writes each note straight into the currently-playing bank's grid,
+  that isn't the pattern or a take replaying itself) writes each note
+  straight into whichever bank is currently sounding in the chain,
   quantized to whichever step is active at that instant - so the
-  pattern itself changes and loops what you just sang. Singing louder
+  pattern itself changes and loops what you just sang, following the
+  chain automatically as it advances from bank to bank. Singing louder
   (velocity at or above 110) accents the step automatically, the same
   as a manual right-click. Only the exact step a note lands on is ever
   touched - every other step (hand-programmed or previously recorded)
   is left completely alone, so nothing gets erased just by arming
-  Record or switching banks, only by an actual new note landing on that
-  specific step. **Record and Play take both automatically start the
-  step sequencer's pattern playback if it isn't already running** (and
+  Record or the chain moving to a new bank, only by an actual new note
+  landing on that specific step. **Record and Play take both
+  automatically start the sequencer if it isn't already running** (and
   never stop it - Play pattern/Stop still owns that), so pressing either
   one always has something actually looping to record into or
   accompany, instead of silently capturing nothing.
@@ -287,18 +303,17 @@ python3 tools/synth_studio.py
   (`tools/midi_recorder.py`): in parallel with writing into the step
   grid above, **Record** also captures the exact same performance
   unquantized, at its real timing, as a separate "take" - useful for an
-  accurate export the quantized grid can't represent. Recording always
-  follows whichever bank is currently selected (default: bank 1) -
-  switching banks *while armed* finalizes what you just captured and
-  immediately starts capturing into the new bank instead, no need to
-  stop and restart Record for each one. A bank's existing take is only
-  ever replaced once a switch (or Stop) finalizes a segment that
-  actually captured a note - just landing on, or re-arming over, a bank
-  that already has one never erases it. **Play take** loops that bank's
-  captured performance at its original timing, repeating automatically
-  until Stop; **💾 Save** exports it as a standard `.mid` file under
-  `tools/recordings/` (gitignored) - a real, DAW-importable MIDI
-  recording, not audio, and the one place your performance's exact,
+  accurate export the quantized grid can't represent. Recording follows
+  the chain automatically too - as playback moves from bank to bank, it
+  finalizes what was just captured and starts a fresh segment for the
+  new bank, no need to stop and restart Record. A bank's existing take
+  is only ever replaced once a transition (or Stop) finalizes a segment
+  that actually captured a note - just passing through, or re-arming
+  over, a bank that already has one never erases it. **Play take** loops
+  that bank's captured performance at its original timing, repeating
+  automatically until Stop; **💾 Save** exports it as a standard `.mid`
+  file under `tools/recordings/` (gitignored) - a real, DAW-importable
+  MIDI recording, not audio, and the one place your performance's exact,
   unquantized timing survives (the step grid it also writes into is
   necessarily quantized to 16 steps) - the same idea as a hardware loop
   pedal or a DAW's Session View clip, recorded alongside the pattern it
@@ -326,44 +341,64 @@ python3 tools/synth_studio.py
 >   an adversarial rapid-note-change/voice-stealing stress test - caught
 >   two real envelope bugs (FM Bell and Pluck were silently producing
 >   zero output).
-> - **Sequencer + step-recorder correctness** (`python3
->   tools/test_sequencer.py`, 67 headless checks): tempo math, step
->   ordering/gating, accent velocity, bank switching mid-playback, a real
->   threading race caught and fixed (a fast Stop-then-Play could
->   silently no-op, or - worse - leave an orphaned background thread
->   still firing notes after a restart), and `StepRecorder` - external
->   notes land on the correct step and accent correctly by velocity,
->   the pattern's own notes and take-playback notes are never written
->   back into the grid (no self-write-back/take-of-a-take loop), an
->   existing step survives untouched unless a new note actually lands
->   on it, and bank switches are followed with zero extra wiring since
->   it always writes into whichever bank is currently active.
+> - **Serial port detection** (`python3 tools/test_midi_link.py`, 10
+>   headless checks, port enumeration mocked so it passes regardless of
+>   what's actually plugged in): the Espressif-VID port is correctly
+>   identified and preferred over connection order, with a sane fallback
+>   (first port found) when no such match exists.
+> - **Sequencer + chain + step-recorder correctness** (`python3
+>   tools/test_sequencer.py`, headless): tempo math, step ordering/
+>   gating, accent velocity, a real threading race caught and fixed (a
+>   fast Stop-then-Play could silently no-op, or - worse - leave an
+>   orphaned background thread still firing notes after a restart), the
+>   bank chain itself (plays each bank in order then wraps, extending or
+>   shrinking mid-playback takes effect on the next boundary, a shrink
+>   that leaves the current bank out of range restarts cleanly from bank
+>   1 rather than landing somewhere arbitrary), and `StepRecorder` -
+>   external notes land on the correct step and accent correctly by
+>   velocity, the pattern's own notes and take-playback notes are never
+>   written back into the grid (no self-write-back/take-of-a-take loop),
+>   an existing step survives untouched unless a new note actually lands
+>   on it, and bank changes (including automatic chain advances) are
+>   followed with zero extra wiring since it always writes into whichever
+>   bank is currently active.
 > - **MIDI recorder correctness** (`python3 tools/test_midi_recorder.py`,
->   69 headless checks): capture timing/ordering/dedup, playback firing
->   the right notes at the right times with no stuck notes on an early
->   stop, looped playback genuinely repeating rather than stopping after
->   one pass, the exact same restart race as the sequencer's (found and
->   fixed the same way), the bank-following live-looper logic
->   (`LiveRecordSession`) - switching banks while armed finalizes and
->   retargets correctly, and switching to/re-arming on a bank with no
->   new notes never fabricates or erases a take - and the `.mid` file
->   writer verified by round-tripping its actual output bytes through a
->   small standalone parser written into the test itself, not just
->   checking the encoder's own internal consistency.
+>   headless): capture timing/ordering/dedup, playback firing the right
+>   notes at the right times with no stuck notes on an early stop, looped
+>   playback genuinely repeating rather than stopping after one pass, the
+>   exact same restart race as the sequencer's (found and fixed the same
+>   way), the bank-following live-looper logic (`LiveRecordSession`) -
+>   bank transitions (manual or chain-driven) finalize and retarget
+>   correctly, passing through a bank with no new notes never fabricates
+>   or erases a take, and a genuine race found and fixed along the way: a
+>   note logged by a background thread microseconds before a segment's
+>   `start()`/bank-switch actually ran could look like it happened
+>   "before recording began" and get silently dropped - fixed by making
+>   the segment's own time-zero lazy (defined by the first event it
+>   actually captures) instead of eagerly stamped at `start()` time. The
+>   `.mid` file writer is verified by round-tripping its actual output
+>   bytes through a small standalone parser written into the test itself,
+>   not just checking the encoder's own internal consistency.
 > - **Interactive verification**: every control in this section (tempo
->   slider, bank buttons, step grid, Record/Play take/Save) was driven
->   programmatically end to end (`.invoke()` on buttons, the same
->   variable-write path a real slider drag takes) and checked against
->   real state changes - this is how a **real bug in the tempo slider**
->   was caught and fixed: `Scale(variable=..., command=...)` doesn't
->   reliably fire `command` in Tkinter even from the widget's own
->   `.set()`, a known pitfall; replaced with a variable trace, which does.
-> - **End-to-end integration**: `synth_studio.py --smoke-test N` opens
->   the real window, connects to the real board over serial, programs a
->   sequencer pattern, plays it, records a take from it, plays the take
->   back, and saves it - verifying a real, valid, correctly-timed `.mid`
->   file came out the other end - all through the exact same code path
->   the UI buttons call.
+>   slider, bank buttons, step grid, Record/Play take/Save, the serial
+>   port dropdown) was driven programmatically end to end (`.invoke()` on
+>   buttons, the same variable-write path a real slider drag takes) and
+>   checked against real state changes - this is how two real bugs were
+>   actually caught: the tempo slider (`Scale(variable=...,
+>   command=...)` doesn't reliably fire `command` in Tkinter even from
+>   the widget's own `.set()`, a known pitfall - replaced with a variable
+>   trace, which does), and a bank's own first note occasionally landing
+>   in the wrong take right after a chain transition (the lazy-start-time
+>   race described above).
+> - **End-to-end integration**: `groovebox.py --smoke-test N` opens the
+>   real window, connects to the real board over serial, programs a
+>   sequencer pattern, arms Record *before* starting playback (proving
+>   Record itself starts the pattern, not the other way around), lets the
+>   chain advance across bank boundaries while singing simulated notes,
+>   verifies each bank attributed its own notes correctly and an
+>   untouched bank stayed empty, plays a take back on loop, and saves it
+>   - verifying a real, valid, correctly-timed `.mid` file came out the
+>   other end - all through the exact same code path the UI buttons call.
 
 ## 📖 How to use it
 
