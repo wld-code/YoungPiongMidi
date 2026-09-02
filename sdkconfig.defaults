@@ -1,0 +1,23 @@
+# YoungPiongMidi default sdkconfig for ESP-SensairShuttle v1.0
+# (ESP32-C5-WROOM-1-N16R8: 16 MB flash, 8 MB PSRAM).
+#
+# Applied by `idf.py set-target esp32c5` / `idf.py build` on first configure.
+# Re-run `idf.py set-target esp32c5` after editing this file if sdkconfig
+# already exists, or delete sdkconfig to regenerate from scratch.
+
+CONFIG_IDF_TARGET="esp32c5"
+
+# --- Flash / PSRAM -----------------------------------------------------
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+CONFIG_SPIRAM=y
+
+# --- Console / logging ---------------------------------------------------
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+
+# --- FreeRTOS --------------------------------------------------------
+# 1kHz tick gives finer-grained vTaskDelay() timing for the audio/UI task
+# periods used throughout this project (see yp_config.h).
+CONFIG_FREERTOS_HZ=1000
