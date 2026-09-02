@@ -129,13 +129,26 @@ or dropped blocks over sustained runs.
 
 ## Host-side testing
 
-Not yet set up (see `test/` - empty). Planned, per the project spec's
-section 17: synthetic sine inputs (440 Hz -> A4/69, 261.63 Hz -> C4/60,
-329.63 Hz -> E4/64, plus noisy variants) exercising
-frequency<->MIDI-note conversion, RMS, the envelope follower, YIN, and
-(once implemented) note stabilization, all without hardware. `rms.c`,
-`envelope.c` and `yin.c` are all plain, portable C with no ESP-IDF
-dependency for exactly this reason (yin.c's fixed-point math is standard
-`int16_t`/`int32_t`/`int64_t`, nothing RISC-V- or ESP-IDF-specific), so
-this is a matter of adding a host build target, not restructuring the DSP
-code.
+Implemented - see `test/` and `test/README.md`. `make -C test test` builds
+and runs, with a plain host C compiler (no ESP-IDF, no board): 211 checks
+across 4 suites as of this writing, all passing. Covers frequency<->MIDI-
+note conversion (including the spec's own reference frequencies - 440 Hz
+-> A4/69, 261.63 Hz -> C4/60, 329.63 Hz -> E4/64), RMS, the envelope
+follower, and YIN with both clean and noisy synthetic sine inputs
+(project spec section 17). Note stabilization (Milestone 5, not yet
+implemented) will get its own suite once it exists.
+
+This exists because `rms.c`, `envelope.c`, `yin.c` and `voice_midi.c` are
+all plain, portable C with no ESP-IDF dependency, on purpose (yin.c's
+fixed-point math is standard `int16_t`/`int32_t`/`int64_t`, nothing
+RISC-V- or ESP-IDF-specific) - keeping the DSP/conversion code free of
+`esp_log.h`/FreeRTOS/etc is what made "add a host build target" the whole
+job, rather than "restructure the DSP code first."
+
+One of these tests (`test_pitch.c`'s `test_pure_tones_match_spec_examples`)
+is a genuine end-to-end check spanning two components: it synthesizes a
+sine wave, runs it through YIN, then feeds YIN's *output* frequency into
+`yp_frequency_to_midi_note()` and asserts the resulting MIDI note matches
+- catching a bug that a unit test confined to either component alone
+would miss (e.g. YIN reporting a frequency a few Hz off that still
+happens to round to the wrong MIDI note).

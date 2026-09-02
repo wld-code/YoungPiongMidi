@@ -43,8 +43,12 @@ components/
                  why) for its hot inner loop; narrow samples-in/
                  {frequency_hz,confidence}-out interface so it stays
                  swappable for a different algorithm later.
-  voice_midi/    Not yet implemented (Milestones 5-10). Note
-                 stabilization state machine + dynamics->MIDI mapping.
+  voice_midi/    Frequency<->MIDI note conversion (Milestone 4, done -
+                 see voice_midi.c/.h: pure math, no ESP-IDF dependency,
+                 host-tested in test/test_midi_notes.c). Note
+                 stabilization state machine + dynamics->MIDI mapping
+                 (Milestones 5-10) not yet implemented - will land in
+                 note_state_machine.c alongside this file.
   midi/          Not yet implemented (Milestones 8-9). Transport-
                  independent MIDI event queue + BLE/UART backends.
   display/       Direct-SPI ST7789P3 driver + tiny bitmap-font UI
@@ -57,11 +61,13 @@ main/            Task wiring: creates dsp_task and ui_task, starts
                  hand-off between them.
 ```
 
-`components/voice_midi` and `components/midi` exist as directories
-(matching the repository layout the project spec asks for) but currently
-contain only a README pointing back here - see "Roadmap" below. Nothing
-in `main/` references them yet, so their absence does not affect the
-current build. `components/pitch` is implemented (see above).
+`components/midi` exists as a directory (matching the repository layout
+the project spec asks for) but currently contains only a README pointing
+back here - see "Roadmap" below; nothing in `main/` references it yet.
+`components/pitch` and `components/voice_midi` are implemented (see
+above) - `voice_midi` currently holds only frequency<->MIDI conversion
+(voice_midi.c); its future note_state_machine.c (Milestones 5+) does not
+exist yet.
 
 ## FreeRTOS architecture
 
@@ -132,7 +138,7 @@ Matches the project spec's Section 22. Status as of this document:
 | 1 | Continuous mic acquisition + basic signal display | Done, verified on hardware |
 | 2 | RMS/envelope + voice activity detection | Done, verified on hardware |
 | 3 | Fundamental frequency detection (YIN) | Done, verified on hardware |
-| 4 | Frequency -> MIDI note conversion | Not started |
+| 4 | Frequency -> MIDI note conversion | Done, host-tested + verified on hardware |
 | 5 | MIDI Note On/Off generation | Not started |
 | 6 | Vocal dynamics -> MIDI velocity | Not started |
 | 7 | Continuous CC11 Expression | Not started |

@@ -3,8 +3,9 @@
  * @brief YoungPiongMidi entry point.
  *
  * Current milestones implemented: 1 (continuous microphone acquisition +
- * basic signal display), 2 (RMS/envelope + voice activity detection), and
- * 3 (YIN fundamental frequency detection - see components/pitch).
+ * basic signal display), 2 (RMS/envelope + voice activity detection),
+ * 3 (YIN fundamental frequency detection - see components/pitch), and
+ * 4 (frequency -> MIDI note conversion - see components/voice_midi).
  * See docs/architecture.md for the full roadmap and README.md for status.
  *
  * Task layout (see docs/architecture.md "FreeRTOS architecture" for the
@@ -31,6 +32,7 @@
 #include "audio_dsp.h"
 #include "display.h"
 #include "self_test.h"
+#include "voice_midi.h"
 
 static const char *TAG = "main";
 
@@ -91,9 +93,16 @@ static void dsp_task(void *arg)
 
         if (YP_DEBUG_VOICE_LOG && (now - last_log_us) >= (YP_DEBUG_LOG_INTERVAL_MS * 1000)) {
             last_log_us = now;
-            ESP_LOGI(TAG, "pitch=%.1fHz confidence=%.2f rms=%.4f level=%.4f voice_active=%d clipped=%d",
-                     analysis.frequency_hz, analysis.confidence,
-                     analysis.rms, analysis.level, analysis.voice_active, block.clipped);
+            if (analysis.confidence >= YP_PITCH_CONFIDENCE_THRESHOLD && analysis.frequency_hz > 0.0f) {
+                yp_note_info_t note = yp_frequency_to_note_info(analysis.frequency_hz);
+                ESP_LOGI(TAG, "pitch=%.1fHz note=%s%d midi=%d cents=%.1f confidence=%.2f rms=%.4f level=%.4f voice_active=%d clipped=%d",
+                         analysis.frequency_hz, note.note_name, note.octave, note.midi_note, note.cents,
+                         analysis.confidence, analysis.rms, analysis.level, analysis.voice_active, block.clipped);
+            } else {
+                ESP_LOGI(TAG, "pitch=%.1fHz note=--- confidence=%.2f rms=%.4f level=%.4f voice_active=%d clipped=%d",
+                         analysis.frequency_hz, analysis.confidence,
+                         analysis.rms, analysis.level, analysis.voice_active, block.clipped);
+            }
         }
 
         if ((now - last_stats_us) >= (YP_DEBUG_STATS_INTERVAL_MS * 1000) && stats_frame_count > 0) {
@@ -124,8 +133,9 @@ static void dsp_task(void *arg)
 /* -------------------------------------------------------------------- */
 #define UI_Y_TITLE      8
 #define UI_Y_SUBTITLE   24
-#define UI_Y_FREQ       44
-#define UI_Y_CONF       60
+#define UI_Y_NOTE       44
+#define UI_Y_FREQ       60
+#define UI_Y_CONF       76
 #define UI_METER_H      20
 #define UI_Y_METER      ((DISPLAY_HEIGHT - UI_METER_H) / 2)   /* vertically centered */
 #define UI_Y_LEVEL_LBL  (UI_Y_METER - 16)
@@ -162,6 +172,22 @@ static void ui_task(void *arg)
 
             bool pitch_ok = analysis.confidence >= YP_PITCH_CONFIDENCE_THRESHOLD
                              && analysis.frequency_hz > 0.0f;
+
+            /* NOTE line: note name/octave vary enough in rendered width
+             * (e.g. "A4" vs "C#-1") that a fixed printf field is fragile,
+             * so clear the line's rect before redrawing it rather than
+             * relying on field-width padding like the lines below do. */
+            display_fill_rect(8, UI_Y_NOTE, DISPLAY_WIDTH - 16, 8, DISPLAY_COLOR_BLACK);
+            if (pitch_ok) {
+                yp_note_info_t note = yp_frequency_to_note_info(analysis.frequency_hz);
+                if (note.valid) {
+                    snprintf(line, sizeof(line), "NOTE %s%d %+.0fC", note.note_name, note.octave, note.cents);
+                    display_draw_text(8, UI_Y_NOTE, line, DISPLAY_COLOR_YELLOW, DISPLAY_COLOR_BLACK, 1);
+                }
+            } else {
+                display_draw_text(8, UI_Y_NOTE, "NOTE ---", DISPLAY_COLOR_GRAY, DISPLAY_COLOR_BLACK, 1);
+            }
+
             /* Fixed field widths so a shorter new string never leaves a
              * fragment of a longer old one behind on screen. */
             if (pitch_ok) {

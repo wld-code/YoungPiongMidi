@@ -18,18 +18,20 @@ notes:
 **Implemented and verified on real hardware**: continuous microphone
 acquisition (ADC continuous mode + DMA, no blocking one-shot reads), DC
 removal, high-pass and low-pass filtering, RMS, an attack/release
-envelope follower, debounced voice-activity detection, and YIN
-fundamental-frequency (pitch) detection, all running as dedicated
+envelope follower, debounced voice-activity detection, YIN
+fundamental-frequency (pitch) detection, and frequency -> MIDI note
+conversion (note name, octave, cents deviation), all running as dedicated
 FreeRTOS tasks and displayed live on the on-board LCD plus rate-limited
-serial diagnostics.
+serial diagnostics. The pitch/note math is also covered by a real,
+passing host-side test suite - see "Testing" below.
 
-**Not yet implemented**: frequency -> MIDI note conversion, MIDI note
-generation, BLE/DIN MIDI output, dynamics-to-velocity/CC11 mapping, pitch
-bend. See "Roadmap" below and `docs/architecture.md` for the full
+**Not yet implemented**: MIDI note generation (the note-stabilization
+state machine), BLE/DIN MIDI output, dynamics-to-velocity/CC11 mapping,
+pitch bend. See "Roadmap" below and `docs/architecture.md` for the full
 milestone list. This is deliberate, incremental development, not an
 oversight - the project spec this firmware follows explicitly asks for
-each stage to be proven on hardware before the next is built on top of
-it.
+each stage to be proven (on hardware, and where possible in an automated
+test) before the next is built on top of it.
 
 ## Hardware
 
@@ -54,7 +56,7 @@ ADC + DMA
     |
 Audio DSP (DC removal, HPF/LPF, RMS, envelope, VAD)
     |
-Pitch + Dynamics            <- pitch (YIN) done; note conversion not yet
+Pitch + Dynamics            <- pitch (YIN) + note conversion done
     |
 Voice-to-MIDI Engine        <- not yet implemented
     |
@@ -75,11 +77,12 @@ components/
   audio_capture/    ADC continuous-mode acquisition
   audio_dsp/        RMS, envelope, voice-activity detection
   pitch/            YIN fundamental-frequency detection
-  voice_midi/       (placeholder - Milestones 5-10)
+  voice_midi/       Frequency<->MIDI note conversion (note_state_machine
+                     for Milestones 5-10 not yet implemented)
   midi/             (placeholder - Milestones 5, 8-10)
   display/          ST7789P3 driver + UI primitives
 docs/               architecture.md, hardware.md, dsp.md, midi.md, tuning.md
-test/               Host-side DSP tests (not yet populated)
+test/               Host-side tests (real, passing - see test/README.md)
 tools/              plot_audio.py, analyze_pitch.py (not yet written)
 ```
 
@@ -103,19 +106,33 @@ idf.py -p /dev/cu.usbmodemXXXX flash monitor
 (On Linux, the port is typically `/dev/ttyACM0`. ESP32-C5 uses native
 USB-Serial/JTAG, so no external USB-UART bridge or drivers are needed.)
 
+## Testing
+
+The frequency<->MIDI-note conversion, RMS, envelope follower and YIN
+pitch detector all have real, hardware-independent unit tests:
+
+```sh
+cd test
+make            # builds and runs every suite; fails loudly on any failure
+```
+
+No ESP-IDF or board required - see `test/README.md` for what each suite
+actually checks. As of this writing: 211 checks across 4 suites, all
+passing.
+
 ## How to use it
 
 Power the board (or plug it into a PC over USB) and watch the console:
 diagnostics print at a rate-limited interval (`YP_DEBUG_LOG_INTERVAL_MS`
-in `yp_config.h`) as
-`pitch=...Hz confidence=... rms=... level=... voice_active=... clipped=...`,
-and the LCD shows the same pitch/confidence, a live level meter, and RMS/
-status. Speaking or singing into the microphone should move the level
-meter, flip `voice_active` to 1, and - for a sustained, clear pitch -
-show a frequency with confidence above `YP_PITCH_CONFIDENCE_THRESHOLD`
-(0.55 by default; below that the LCD shows `FREQ --- HZ` rather than a
-noisy guess). There is no MIDI output yet, and no frequency -> note name
-conversion yet either - the display shows raw Hz.
+in `yp_config.h`) as, e.g.,
+`pitch=440.2Hz note=A4 midi=69 cents=0.8 confidence=0.96 rms=... level=... voice_active=1 clipped=0`
+(or `note=---` while confidence is below `YP_PITCH_CONFIDENCE_THRESHOLD`,
+0.55 by default), and the LCD shows the same note/frequency/confidence, a
+live level meter, and RMS/status. Speaking or singing a sustained, clear
+pitch into the microphone should move the level meter, flip
+`voice_active` to 1, and show a note name (e.g. `NOTE A4  +1C`) instead
+of `NOTE ---`. There is no MIDI output yet - the note is computed and
+displayed, but nothing is sent anywhere.
 
 ## Current status
 
@@ -148,7 +165,7 @@ front-end.
 | 1 | Continuous mic acquisition + basic signal display | Done |
 | 2 | RMS/envelope + voice activity detection | Done |
 | 3 | Fundamental frequency detection (YIN) | Done |
-| 4 | Frequency -> MIDI note conversion | Planned |
+| 4 | Frequency -> MIDI note conversion | Done, host-tested + verified on hardware |
 | 5 | MIDI Note On/Off generation | Planned |
 | 6 | Vocal dynamics -> MIDI velocity | Planned |
 | 7 | Continuous CC11 Expression | Planned |
