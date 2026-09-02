@@ -46,6 +46,7 @@
 #include "self_test.h"
 #include "voice_midi.h"
 #include "midi.h"
+#include "onboard_synth.h"
 
 static const char *TAG = "main";
 
@@ -316,6 +317,12 @@ void app_main(void)
         ESP_ERROR_CHECK(display_init());
         self_test_run();
     }
+
+    /* Must come after self_test_run() (which fully tears down its own
+     * temporary I2S_NUM_0 use) and before midi_init() (whose midi_task
+     * will start dispatching events as soon as it's created) - see
+     * onboard_synth_init()'s doc comment. */
+    ESP_ERROR_CHECK(onboard_synth_init());
 
     ESP_ERROR_CHECK(audio_dsp_init());
     ESP_ERROR_CHECK(audio_capture_init());

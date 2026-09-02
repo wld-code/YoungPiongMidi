@@ -267,25 +267,48 @@ def main():
                      help="instead of live playback, listen for this many seconds and write a WAV "
                           "file (--wav-out) - no audio device needed, useful for headless verification")
     ap.add_argument("--wav-out", default="acid_capture.wav")
+    ap.add_argument("--play-seconds", type=float, default=None,
+                     help="for live playback (--self-test or normal serial mode): stop automatically "
+                          "after this many seconds instead of running until Ctrl+C")
+    ap.add_argument("--self-test", action="store_true",
+                     help="play a fixed acid riff through the audio device instead of listening to "
+                          "serial - use this first if you suspect no sound is an audio-routing problem "
+                          "rather than a MIDI-generation problem")
     args = ap.parse_args()
 
     if args.list_devices:
         print(sd.query_devices())
+        print("default:", sd.default.device)
         return
-
-    port = args.port or find_default_port()
 
     state = SharedMidiState()
     voice = AcidVoice(SAMPLE_RATE)
     volume = args.volume
-
     stop_event = threading.Event()
-    reader = threading.Thread(target=serial_reader_thread, args=(port, args.baud, state, stop_event), daemon=True)
-    reader.start()
+
+    if args.self_test:
+        print("Self-test: playing a fixed riff, no board/serial involved.")
+
+        def self_test_thread():
+            riff = [45, 45, 48, 45, 52, 45, 43, 45]  # a little acid-ish loop
+            i = 0
+            while not stop_event.is_set():
+                state.note_on(riff[i % len(riff)], 100 if i % 4 == 0 else 60)
+                time.sleep(0.16)
+                state.note_off(riff[i % len(riff)])
+                time.sleep(0.02)
+                i += 1
+
+        threading.Thread(target=self_test_thread, daemon=True).start()
+    else:
+        port = args.port or find_default_port()
+        reader = threading.Thread(target=serial_reader_thread, args=(port, args.baud, state, stop_event), daemon=True)
+        reader.start()
 
     if args.record_seconds is not None:
         import wave
-        print(f"Recording {args.record_seconds:.1f}s from {port} to {args.wav_out} (no audio device used)...")
+        source = "self-test riff" if args.self_test else port
+        print(f"Recording {args.record_seconds:.1f}s from {source} to {args.wav_out} (no audio device used)...")
         total_samples = int(args.record_seconds * SAMPLE_RATE)
         rendered = 0
         chunks = []
@@ -313,14 +336,29 @@ def main():
         block = voice.render(frames, state) * volume
         outdata[:, 0] = block
 
-    print("YoungPiongMidi acid synth monitor - Ctrl+C to stop.")
-    print(f"audio: {SAMPLE_RATE} Hz, block={BLOCK_SIZE}, device={args.device or '(default)'}")
+    if args.device is not None:
+        resolved_device = args.device
+    else:
+        try:
+            resolved_device = sd.default.device[1]
+        except TypeError:
+            resolved_device = sd.default.device
+    device_name = sd.query_devices(resolved_device)["name"]
+    print("YoungPiongMidi acid synth monitor"
+          + (" (self-test riff)" if args.self_test else "")
+          + (f" - auto-stopping after {args.play_seconds:.0f}s" if args.play_seconds else " - Ctrl+C to stop"))
+    print(f"audio out: [{resolved_device}] {device_name}  ({SAMPLE_RATE} Hz, block={BLOCK_SIZE})")
+    print("(if you don't hear anything, that device may not be what's physically playing sound - "
+          "try --list-devices and pass --device N for e.g. built-in speakers)")
 
     try:
         with sd.OutputStream(samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE, channels=1,
                               dtype="float32", device=args.device, callback=audio_callback):
-            while True:
-                time.sleep(0.2)
+            if args.play_seconds is not None:
+                time.sleep(args.play_seconds)
+            else:
+                while True:
+                    time.sleep(0.2)
     except KeyboardInterrupt:
         pass
     finally:

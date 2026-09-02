@@ -1,5 +1,6 @@
 #include <string.h>
 #include "midi.h"
+#include "onboard_synth.h"
 #include "yp_config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -40,12 +41,19 @@ static void log_event(const midi_event_t *ev)
 /* Dispatch one dequeued event to every enabled transport. With both
  * YP_MIDI_BLE_ENABLED and YP_MIDI_UART_ENABLED at 0 (current default -
  * see yp_config.h), the #if below compiles away to nothing but
- * log_event(); flipping either flag once its transport component exists
- * (Milestones 8/9) adds a real send call here without anything upstream
- * changing. */
+ * log_event()/onboard_synth_handle_event(); flipping either flag once
+ * its transport component exists (Milestones 8/9) adds a real send call
+ * here without anything upstream changing.
+ *
+ * onboard_synth is not one of the spec's BLE/UART transports - it's a
+ * "hear it on the board itself, no laptop needed" path, self-contained
+ * and always on (onboard_synth_handle_event() no-ops safely if the
+ * synth failed to init, so this is never a reason for a dequeued event
+ * to be lost). */
 static void dispatch_event(const midi_event_t *ev)
 {
     log_event(ev);
+    onboard_synth_handle_event(ev);
 
 #if YP_MIDI_BLE_ENABLED
 #error "YP_MIDI_BLE_ENABLED is set but midi_ble.c does not exist yet (Milestone 8)"

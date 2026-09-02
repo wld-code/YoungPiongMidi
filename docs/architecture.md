@@ -57,9 +57,13 @@ components/
   midi/          Transport-independent MIDI event queue + midi_task
                  (Milestone 5, done - midi.h/.c): builds midi_event_t
                  from voice_midi's decisions and dispatches to whichever
-                 transport(s) are enabled. Neither is yet (Milestones
-                 8-9), so the only "transport" today is a diagnostic log
-                 line per event - see docs/midi.md.
+                 transport(s) are enabled. BLE/UART aren't yet
+                 (Milestones 8-9). Two things happen with every event
+                 today regardless: a diagnostic log line, and real audio
+                 on the board's own speaker (onboard_synth.c - a small
+                 fixed-point square/PWM voice, not a spec milestone but
+                 a verification aid, see docs/midi.md for why it has no
+                 resonant filter).
   display/       Direct-SPI ST7789P3 driver + tiny bitmap-font UI
                  primitives. Deliberately not a full LVGL/esp_lcd_panel
                  stack - the UI need (section 13 of the spec) is a

@@ -142,22 +142,60 @@ simple linear mapping), and an explicit check of the CC11 throttle's two
 gates (value delta and minimum interval) independently - see docs/midi.md
 for why both are required rather than either alone.
 
-## Live acid-synth monitor
+## Hearing MIDI output before Milestone 8/9 exist
 
-There is no wire MIDI transport yet (see "Roadmap"), so
-`tools/acid_synth_monitor.py` is a development tool that lets you *hear*
-what the firmware is deciding, live: it reads the board's serial console,
-parses the same `NOTE_ON`/`NOTE_OFF`/`CC` lines `midi_task` logs, and
-plays them through a small monophonic acid/TB-303-style synth (sawtooth
-oscillator -> resonant lowpass filter, with the filter's classic
+There is no wire MIDI transport yet (see "Roadmap"), so two things let
+you *hear* what the firmware is deciding, live - both driven by the
+exact same `midi_task` events, both audible the moment a note fires:
+
+1. **The board's own speaker** - always on, no setup, nothing to run.
+   `components/midi/onboard_synth.c` renders every event to a small
+   fixed-point square/PWM voice (velocity -> amplitude, CC11 Expression
+   -> pulse width). See docs/midi.md for why this voice has no resonant
+   filter (a real, measured instability found in the Python synth below
+   made that not worth reproducing in fixed-point on a chip with no
+   FPU). Because the mic and speaker are physically close together on
+   this board, playing loud enough for the mic to pick the speaker back
+   up can cause an audible feedback loop - if the board starts
+   self-triggering notes, that's what's happening, not a firmware bug.
+2. **`tools/acid_synth_monitor.py`** (below) - a different, filtered
+   acid/TB-303-style voice running on a connected computer, useful when
+   you want the richer sound or a WAV capture.
+
+### Live acid-synth monitor (host tool)
+
+`tools/acid_synth_monitor.py` is a development tool that lets a
+connected computer *hear* what the firmware is deciding, live: it reads
+the board's serial console, parses the same `NOTE_ON`/`NOTE_OFF`/`CC`
+lines `midi_task` logs, and plays them through a small monophonic
+acid/TB-303-style synth (sawtooth oscillator -> resonant lowpass filter,
+with the filter's classic
 "squelch" envelope retriggered per note, velocity driving accent, and
 CC11 Expression sweeping the filter cutoff live).
 
 ```sh
 pip install pyserial numpy sounddevice
-python3 tools/acid_synth_monitor.py           # auto-detects /dev/cu.usbmodem*
+python3 tools/acid_synth_monitor.py                       # auto-detects /dev/cu.usbmodem*
+python3 tools/acid_synth_monitor.py --self-test            # plays a fixed riff, no board needed -
+                                                             # use this first to check the audio path itself
+python3 tools/acid_synth_monitor.py --list-devices          # see output device indices/names
+python3 tools/acid_synth_monitor.py --device 2               # force a specific output device
+python3 tools/acid_synth_monitor.py --play-seconds 10        # auto-stop instead of Ctrl+C
 python3 tools/acid_synth_monitor.py --record-seconds 10 --wav-out clip.wav  # headless capture, no audio device
 ```
+
+**If you don't hear anything**: this is almost always audio *routing*,
+not a bug in the synth - `--self-test` isolates the two. macOS's default
+output device index can silently change (e.g. a Bluetooth headset
+connecting/disconnecting shifts every other device's index and can
+leave the *system* default pointed at a device that isn't actually
+active) - `--list-devices` shows the current, real device list;
+`--device N` pins a specific one (e.g. built-in speakers) so playback
+doesn't depend on whatever the system currently considers "default." If
+`--self-test` plays fine but the normal (board-connected) mode is
+silent, that's not a bug either - it means no note has crossed
+`YP_PITCH_CONFIDENCE_THRESHOLD` recently (the room is quiet, or nothing
+is near the mic); make some noise near the board's microphone.
 
 This is a verification/demo tool, not a project deliverable - it does
 not modify or depend on any change to the firmware, and it has nothing
@@ -182,11 +220,14 @@ flip `voice_active` to 1, show a note name (e.g. `NOTE A4  +1C`) instead
 of `NOTE ---`, and - once held stably for a few frames - produce a real
 `midi: NOTE_ON  ch=0 note=69 vel=84` line as the note-stabilization state
 machine commits it, followed by `midi: CC ch=0 cc=11 val=...` lines
-tracking your voice's loudness while the note is held. There is no wire
-MIDI output yet (BLE/UART are Milestones 8-9) - events are generated and
-queued for real, but the only "transport" today is that log line (or
-`tools/acid_synth_monitor.py`, which turns the same log into sound - see
-above).
+tracking your voice's loudness while the note is held - and, at the same
+moment, a real sound from **the board's own speaker** (a small onboard
+square/PWM synth voice - see "Live acid-synth monitor" below). There is
+no wire MIDI output yet (BLE/UART are Milestones 8-9) - events are
+generated and queued for real, but the only ways to observe them today
+are that log line, the board's own speaker, or
+`tools/acid_synth_monitor.py` on a connected computer (which parses the
+same log over serial into a different, filtered synth sound).
 
 ## Current status
 
