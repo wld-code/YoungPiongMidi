@@ -122,10 +122,15 @@ acquisition-to-analysis latency ~352 us - both well inside the project's
 end-to-end latency target, though this only covers the stages implemented
 so far.
 
-One open hardware question is flagged rather than silently worked around:
-every captured audio block currently reports `clipped = true` even at
-near-silent RMS levels, which looks like an open/unconnected microphone
-input rather than a firmware bug - see `docs/hardware.md`.
+**LCD note**: the panel initially showed nothing at all when first
+connected - traced (via Espressif's own mainboard schematic, not a guess)
+to `GPIO5`/`PWR_CTRL` being an active-**low** power-rail switch, driven
+active-high in the first firmware revision. Fixed and reflashed; the fix
+also happened to resolve an earlier `clipped` finding that had been
+(incorrectly) attributed to the microphone - see `docs/hardware.md` and
+`docs/tuning.md` for the full story. Still needs eyes-on confirmation that
+the panel now actually displays the UI, since this session cannot see the
+board.
 
 ## Roadmap
 

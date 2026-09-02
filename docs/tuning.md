@@ -3,6 +3,42 @@
 Live findings from real-hardware bring-up, kept here instead of only in
 commit messages so they survive.
 
+## Display: LCD power rail polarity was inverted
+
+**Symptom observed on hardware**: LCD physically connected, firmware
+flashed and logged `display: ST7789P3 init done` with no error, but the
+panel showed nothing - no backlight, no image.
+
+**Cause**: `GPIO5`/`PWR_CTRL` was assumed active-high (drive high to power
+the panel) with no hardware evidence either way. Espressif's own
+`esp-sensairshuttle-mainboard-sch-lcd-v1_0.png` schematic shows it actually
+drives the gate of a P-channel MOSFET (Q2, AO3401A) wired as a high-side
+switch from `VCC_3V3` to `LCD_3V3` - active-**low**. Driving it high held
+the switch off, so the ESP32-C5 was faithfully executing a correct SPI
+init sequence against a panel that had no power at all, which is exactly
+why the "init done" log line gave no indication anything was wrong: it
+only reflects the SPI peripheral finishing its own transfer, not any
+acknowledgment from the panel (nothing on this board wires MISO back).
+
+**Fix**: drive `GPIO5` low in `display_init()` instead. See
+`docs/hardware.md` for the full schematic-based reasoning and the pin
+table update.
+
+**Bonus, unexpected side-effect**: this same fix also resolved the
+"`clipped` is always 1" finding recorded earlier below/in
+`docs/hardware.md` - the two circuits share no GPIOs, so the working
+theory is that the unpowered-but-still-SPI-clocked LCD was coupling
+electrical noise into the analog mic front-end via a shared rail or
+ground. Recorded here as a correction, not left as a stale claim: the
+original "probably no microphone connected" guess was reasonable given
+what was known at the time, but turned out to be wrong.
+
+**Takeaway**: a driver logging success only proves the MCU-side half of a
+transaction completed without a bus error. It says nothing about whether
+the peripheral on the other end had power, and "no error, still nothing
+visible" is a power/wiring question, not a protocol one - check the power
+switch/rail before re-reading the datasheet's command tables.
+
 ## Display: text rendering must batch its SPI transactions
 
 **Symptom observed on hardware**: firmware built and flashed cleanly, but

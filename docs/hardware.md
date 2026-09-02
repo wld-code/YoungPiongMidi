@@ -26,7 +26,7 @@ project brief alone:
 | LCD SCL (SPI SCLK) | GPIO24 | user guide + `board_peripherals.yaml` (`spi_display.sclk_io_num`) |
 | LCD CS | GPIO25 | user guide + `board_devices.yaml` (`io_spi_config.cs_gpio_num`) |
 | LCD DC | GPIO26 | user guide + `board_devices.yaml` (`io_spi_config.dc_gpio_num`) |
-| LCD power rail switch | GPIO5 | user guide + `board_devices.yaml` context |
+| LCD power rail switch (**active-low**, see below) | GPIO5 | user guide + `esp-sensairshuttle-mainboard-sch-lcd-v1_0.png` schematic |
 | Boot button | GPIO28 | user guide |
 
 Pins **not** in this table (e.g. a MIDI DIN UART pin) are not defined
@@ -97,19 +97,39 @@ its console:
   transient), confirming the VAD state machine and its debounce logic run
   correctly end to end.
 
-### A real finding, reported honestly rather than glossed over
+### Bug found and fixed: LCD power rail polarity was inverted
 
-Every captured audio block so far has its `clipped` flag set, even though
-measured RMS quickly settles to a very low, quiet-room-like value
-(~0.0001-0.0002 normalized). `clipped` is set when any single raw ADC
-sample lands within 8 codes of 0 or 4095 (see `audio_capture.c`); a signal
-that is otherwise near-silent but occasionally touches a rail is consistent
-with an analog input that has no source connected (a high-gain amplifier
-stage with a floating/open input tends to rail intermittently) rather than
-with genuine acoustic clipping. **This needs to be checked physically**:
-confirm an actual microphone element is connected to the board's analog
-mic input before trusting `clipped` as "the singer is too loud" - right
-now it more likely means "nothing is plugged into the mic input." This is
-exactly the kind of thing `yp_config.h` already asks a bring-up engineer to
-verify (`YP_AUDIO_ADC_ATTEN`'s comment) rather than something this
-firmware can resolve in software.
+The first hardware bring-up connected the LCD, flashed the firmware, and
+the panel showed nothing at all - no image, no backlight - even though the
+console logged `display: ST7789P3 init done` with no error. That log line
+only means the ESP32-C5's SPI peripheral finished sending its command
+sequence without a bus error; nothing on this board reads a status
+register back from the panel (MISO is not wired), so it cannot by itself
+confirm the panel actually received power or responded.
+
+The actual cause was found by pulling Espressif's own
+`esp-sensairshuttle-mainboard-sch-lcd-v1_0.png` schematic (from the same
+`espressif/esp-dev-kits` source used for the pin table above) rather than
+guessing: `GPIO5`/`PWR_CTRL` drives the gate of **Q2, a P-channel MOSFET
+(AO3401A)** wired as a high-side load switch between `VCC_3V3` (source)
+and `LCD_3V3` (drain) - the rail that powers both the ST7789P3 and its
+backlight. A P-channel high-side switch like this is **active-low**:
+pulling the gate low (relative to the source) turns it on. The first
+firmware revision drove `GPIO5` high to "power on" the panel, which is
+backwards - it held the switch off and cut power to the entire LCD rail.
+Fixed by driving `GPIO5` low in `display_init()` (see the comment there
+for the full reasoning); confirmed working by having the LCD's title text
+and level meter physically visible on the board afterward.
+
+A useful side-effect of this fix: before it, every captured audio block
+had its `clipped` flag set even at near-silent RMS (~0.0001-0.0002); after
+it, `clipped` reads 0 and RMS shows normal small ambient-noise variation
+(~0.0008-0.0067). The two circuits are on unrelated GPIOs/buses, so the
+most likely explanation is that the unpowered LCD was still being clocked
+by SPI the whole time, and that switching activity coupled electrical
+noise into the analog microphone front-end over a shared rail/ground
+rather than the microphone genuinely being disconnected as first
+suspected. This is a correction of an earlier (reasonable, but wrong)
+guess in this document, not a new claim to take on faith - if `clipped`
+starts reading 1 again, check the LCD power fix is still in place before
+assuming a microphone wiring problem.

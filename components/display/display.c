@@ -162,8 +162,19 @@ esp_err_t display_init(void)
     err = gpio_config(&dc_cfg);
     if (err != ESP_OK) return err;
 
-    /* Power the panel rail and let it settle before driving SPI. */
-    gpio_set_level(YP_PIN_LCD_PWR, 1);
+    /* Power the panel rail and let it settle before driving SPI.
+     *
+     * PWR_CTRL (GPIO5) drives the gate of a P-channel high-side load
+     * switch (Q2, AO3401A) between VCC_3V3 and LCD_3V3, per Espressif's
+     * own ESP-SensairShuttle mainboard LCD schematic (see docs/hardware.md)
+     * - source=VCC_3V3, drain=LCD_3V3, gate=PWR_CTRL. A PMOS high-side
+     * switch like this is active-LOW: pulling the gate low (below source
+     * by more than the FET's Vgs(th)) turns it on. Driving this pin high
+     * instead cuts LCD_3V3 (and with it the backlight, which is powered
+     * from the same rail), which is exactly what happened on real
+     * hardware - firmware reported a clean SPI init sequence, but the
+     * panel had no power at all. */
+    gpio_set_level(YP_PIN_LCD_PWR, 0);
     vTaskDelay(pdMS_TO_TICKS(20));
 
     spi_bus_config_t bus_cfg = {
