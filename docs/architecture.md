@@ -35,11 +35,14 @@ components/
                  ADC, is simpler than repeating them per downstream
                  consumer.
   audio_dsp/     Per-hop analysis: optional LPF -> RMS -> envelope ->
-                 voice-activity detection. Produces voice_analysis_t.
-                 Does not know about pitch, MIDI, or the display.
-  pitch/         Not yet implemented (Milestone 3). Will consume
-                 audio_block_t (or a filtered variant) and produce
-                 frequency_hz/confidence for voice_analysis_t.
+                 voice-activity detection -> pitch (calls into `pitch`).
+                 Produces voice_analysis_t. Does not know about MIDI or
+                 the display.
+  pitch/         YIN fundamental-frequency detector (Milestone 3, done).
+                 Fixed-point (not float - see docs/dsp.md/tuning.md for
+                 why) for its hot inner loop; narrow samples-in/
+                 {frequency_hz,confidence}-out interface so it stays
+                 swappable for a different algorithm later.
   voice_midi/    Not yet implemented (Milestones 5-10). Note
                  stabilization state machine + dynamics->MIDI mapping.
   midi/          Not yet implemented (Milestones 8-9). Transport-
@@ -54,11 +57,11 @@ main/            Task wiring: creates dsp_task and ui_task, starts
                  hand-off between them.
 ```
 
-`components/pitch`, `components/voice_midi` and `components/midi` exist as
-directories (matching the repository layout the project spec asks for) but
-currently contain only a README pointing back here - see "Roadmap" below.
-Nothing in `main/` references them yet, so their absence does not affect
-the current build.
+`components/voice_midi` and `components/midi` exist as directories
+(matching the repository layout the project spec asks for) but currently
+contain only a README pointing back here - see "Roadmap" below. Nothing
+in `main/` references them yet, so their absence does not affect the
+current build. `components/pitch` is implemented (see above).
 
 ## FreeRTOS architecture
 
@@ -128,7 +131,7 @@ Matches the project spec's Section 22. Status as of this document:
 |---|---|---|
 | 1 | Continuous mic acquisition + basic signal display | Done, verified on hardware |
 | 2 | RMS/envelope + voice activity detection | Done, verified on hardware |
-| 3 | Fundamental frequency detection (YIN) | Not started |
+| 3 | Fundamental frequency detection (YIN) | Done, verified on hardware |
 | 4 | Frequency -> MIDI note conversion | Not started |
 | 5 | MIDI Note On/Off generation | Not started |
 | 6 | Vocal dynamics -> MIDI velocity | Not started |

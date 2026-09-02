@@ -84,26 +84,58 @@ section 7 (SILENCE/ATTACK/NOTE_ACTIVE/NOTE_CHANGE/RELEASE) - that state
 machine belongs to Milestone 5+ (`voice_midi`, not yet implemented) and
 operates on *note* stability, not just voice-present/absent.
 
-## Pitch detection (Milestone 3, not yet implemented)
+## Pitch detection (Milestone 3, implemented)
 
-Per the project spec: YIN (or a carefully normalized autocorrelation
-method) over FFT peak-picking, because FFT bin resolution at
-`YP_AUDIO_SAMPLE_RATE_HZ` / `YP_AUDIO_FRAME_SIZE` is too coarse to resolve
-cents-level pitch across the 80-1000 Hz voice range without heavy
-interpolation, whereas YIN's parabolic-interpolated minimum of the
-cumulative mean normalized difference function is designed for exactly
-this. It will live in `components/pitch` as its own component with a
-narrow interface (samples in, `{frequency_hz, confidence}` out) specifically
-so it can be swapped for a different algorithm later without touching
-`audio_dsp` or anything downstream.
+YIN (de Cheveigne & Kawahara, 2002) over FFT peak-picking, per the project
+spec: FFT bin resolution at `YP_AUDIO_SAMPLE_RATE_HZ` / `YP_AUDIO_FRAME_SIZE`
+is too coarse to resolve cents-level pitch across the 80-1000 Hz voice
+range without heavy interpolation, whereas YIN's parabolic-interpolated
+minimum of the cumulative mean normalized difference function (CMNDF) is
+designed for exactly this. Lives in `components/pitch` (`yin.c`) behind
+the narrow `pitch_detector_process(samples, count) -> {frequency_hz,
+confidence}` interface, independent of `audio_dsp` and everything
+downstream, so a different algorithm could replace it without touching
+either.
+
+**No hardware FPU, measured the hard way.** ESP32-C5 builds with
+`-march=rv32imac` - no `f` (single-precision float hardware) extension,
+unlike ESP32-H4/P4 (`rv32imafc`). The first, all-`float` implementation of
+YIN's O(window x tau_range) difference function measured **~79 ms per
+call** on real hardware against an 8 ms hop budget - every float multiply
+in that loop was a soft-float library call, not a CPU instruction.
+Rewritten with the difference function's hot inner loop in int16 (Q14
+fixed-point) accumulated in `int64_t` - the native, hardware-multiplier
+integer path - this dropped to **~13 ms average / ~17 ms worst case**:
+about 6x faster, but still over an 8 ms hop budget on its own. Only the
+per-tau normalization/threshold-search/interpolation stages (a couple
+hundred float ops per call, not window x tau_range) were left as float,
+where soft-float's cost is negligible. See `yin.c`'s header comment for
+the full reasoning and docs/tuning.md for the numbers as measured at each
+step.
+
+**Decimated, not just optimized.** Even at ~13 ms, running full YIN every
+8 ms hop leaves no headroom once RMS/envelope/VAD/UI/capture are also
+competing for the CPU - confirmed on hardware by task-watchdog resets and
+`audio_capture` queue overflows before this was added. `yin.c` now slides
+its analysis window every hop (no audio is ever skipped), but only runs
+the expensive CMNDF computation once every `YP_PITCH_UPDATE_STRIDE_HOPS`
+(default 3) hops, returning the last computed estimate on the hops in
+between. This is a legitimate, common technique (most pitch trackers
+update well below their sample rate) rather than a compromise: even fast
+vocal vibrato is ~5-8 Hz, far below the ~40 Hz this still gives. Measured
+result: `dsp_task`'s average per-hop time dropped to ~4.7 ms (worst case
+~13 ms, absorbed by the capture queue's depth), with zero watchdog resets
+or dropped blocks over sustained runs.
 
 ## Host-side testing
 
 Not yet set up (see `test/` - empty). Planned, per the project spec's
 section 17: synthetic sine inputs (440 Hz -> A4/69, 261.63 Hz -> C4/60,
 329.63 Hz -> E4/64, plus noisy variants) exercising
-frequency<->MIDI-note conversion, RMS, the envelope follower, and (once
-implemented) YIN and note stabilization, all without hardware. `rms.c` and
-`envelope.c` are already written as pure functions with no ESP-IDF
-dependency for exactly this reason, so this is a matter of adding a host
-build target, not restructuring the DSP code.
+frequency<->MIDI-note conversion, RMS, the envelope follower, YIN, and
+(once implemented) note stabilization, all without hardware. `rms.c`,
+`envelope.c` and `yin.c` are all plain, portable C with no ESP-IDF
+dependency for exactly this reason (yin.c's fixed-point math is standard
+`int16_t`/`int32_t`/`int64_t`, nothing RISC-V- or ESP-IDF-specific), so
+this is a matter of adding a host build target, not restructuring the DSP
+code.

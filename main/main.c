@@ -3,7 +3,8 @@
  * @brief YoungPiongMidi entry point.
  *
  * Current milestones implemented: 1 (continuous microphone acquisition +
- * basic signal display) and 2 (RMS/envelope + voice activity detection).
+ * basic signal display), 2 (RMS/envelope + voice activity detection), and
+ * 3 (YIN fundamental frequency detection - see components/pitch).
  * See docs/architecture.md for the full roadmap and README.md for status.
  *
  * Task layout (see docs/architecture.md "FreeRTOS architecture" for the
@@ -90,7 +91,8 @@ static void dsp_task(void *arg)
 
         if (YP_DEBUG_VOICE_LOG && (now - last_log_us) >= (YP_DEBUG_LOG_INTERVAL_MS * 1000)) {
             last_log_us = now;
-            ESP_LOGI(TAG, "rms=%.4f level=%.4f voice_active=%d clipped=%d",
+            ESP_LOGI(TAG, "pitch=%.1fHz confidence=%.2f rms=%.4f level=%.4f voice_active=%d clipped=%d",
+                     analysis.frequency_hz, analysis.confidence,
                      analysis.rms, analysis.level, analysis.voice_active, block.clipped);
         }
 
@@ -113,14 +115,32 @@ static void dsp_task(void *arg)
 
 /* -------------------------------------------------------------------- */
 /*  ui_task: redraws the LCD at a fixed, DSP-independent rate.           */
+/*                                                                        */
+/*  Layout (240x284 portrait): title block at the top, pitch readout     */
+/*  below it, the level meter vertically centered on the panel, and      */
+/*  RMS/status below that. Y positions are named constants rather than   */
+/*  scattered literals so the "meter in the middle" requirement is       */
+/*  visibly a deliberate computation, not a guess.                       */
 /* -------------------------------------------------------------------- */
+#define UI_Y_TITLE      8
+#define UI_Y_SUBTITLE   24
+#define UI_Y_FREQ       44
+#define UI_Y_CONF       60
+#define UI_METER_H      20
+#define UI_Y_METER      ((DISPLAY_HEIGHT - UI_METER_H) / 2)   /* vertically centered */
+#define UI_Y_LEVEL_LBL  (UI_Y_METER - 16)
+#define UI_Y_RMS        (UI_Y_METER + UI_METER_H + 12)
+#define UI_Y_STATUS_LBL (UI_Y_RMS + 20)
+#define UI_Y_STATUS_VAL (UI_Y_STATUS_LBL + 16)
+
 static void ui_draw_static(void)
 {
     display_clear(DISPLAY_COLOR_BLACK);
-    display_draw_text(8, 8, "YOUNGPIONGMIDI", DISPLAY_COLOR_CYAN, DISPLAY_COLOR_BLACK, 1);
-    display_draw_text(8, 24, "VOICE TO MIDI", DISPLAY_COLOR_GRAY, DISPLAY_COLOR_BLACK, 1);
-    display_draw_text(8, 48, "LEVEL", DISPLAY_COLOR_WHITE, DISPLAY_COLOR_BLACK, 1);
-    display_draw_text(8, 100, "STATUS", DISPLAY_COLOR_WHITE, DISPLAY_COLOR_BLACK, 1);
+    display_draw_text(8, UI_Y_TITLE, "Young Piong Midi controller",
+                       DISPLAY_COLOR_CYAN, DISPLAY_COLOR_BLACK, 1);
+    display_draw_text(8, UI_Y_SUBTITLE, "VOICE TO MIDI", DISPLAY_COLOR_GRAY, DISPLAY_COLOR_BLACK, 1);
+    display_draw_text(8, UI_Y_LEVEL_LBL, "LEVEL", DISPLAY_COLOR_WHITE, DISPLAY_COLOR_BLACK, 1);
+    display_draw_text(8, UI_Y_STATUS_LBL, "STATUS", DISPLAY_COLOR_WHITE, DISPLAY_COLOR_BLACK, 1);
 }
 
 static void ui_task(void *arg)
@@ -130,7 +150,7 @@ static void ui_task(void *arg)
     const TickType_t period = pdMS_TO_TICKS(1000 / YP_UI_REFRESH_RATE_HZ);
     TickType_t last_wake = xTaskGetTickCount();
 
-    char line[24];
+    char line[32];
 
     while (1) {
         voice_analysis_t analysis;
@@ -140,19 +160,35 @@ static void ui_task(void *arg)
             clipped = s_latest_clipped;
             xSemaphoreGive(s_state_mutex);
 
+            bool pitch_ok = analysis.confidence >= YP_PITCH_CONFIDENCE_THRESHOLD
+                             && analysis.frequency_hz > 0.0f;
+            /* Fixed field widths so a shorter new string never leaves a
+             * fragment of a longer old one behind on screen. */
+            if (pitch_ok) {
+                snprintf(line, sizeof(line), "FREQ%7.1fHZ", analysis.frequency_hz);
+            } else {
+                snprintf(line, sizeof(line), "FREQ%7sHZ", "---");
+            }
+            display_draw_text(8, UI_Y_FREQ, line,
+                               pitch_ok ? DISPLAY_COLOR_YELLOW : DISPLAY_COLOR_GRAY,
+                               DISPLAY_COLOR_BLACK, 1);
+
+            snprintf(line, sizeof(line), "CONF%5.2f", analysis.confidence);
+            display_draw_text(8, UI_Y_CONF, line, DISPLAY_COLOR_GRAY, DISPLAY_COLOR_BLACK, 1);
+
             /* Voice levels sit well under 1.0 in practice (VAD threshold
              * is 0.02); scale up so the meter uses its visual range. */
-            display_draw_meter(8, 60, DISPLAY_WIDTH - 16, 18, analysis.level * 3.0f,
+            display_draw_meter(8, UI_Y_METER, DISPLAY_WIDTH - 16, UI_METER_H, analysis.level * 3.0f,
                                 DISPLAY_COLOR_GREEN, DISPLAY_COLOR_BLACK);
 
             snprintf(line, sizeof(line), "RMS %.3f", analysis.rms);
-            display_draw_text(8, 84, line, DISPLAY_COLOR_WHITE, DISPLAY_COLOR_BLACK, 1);
+            display_draw_text(8, UI_Y_RMS, line, DISPLAY_COLOR_WHITE, DISPLAY_COLOR_BLACK, 1);
 
             const char *status = clipped ? "CLIPPING" : (analysis.voice_active ? "VOICE" : "SILENCE");
             uint16_t status_color = clipped ? DISPLAY_COLOR_RED
                                      : (analysis.voice_active ? DISPLAY_COLOR_GREEN : DISPLAY_COLOR_GRAY);
-            display_fill_rect(8, 116, DISPLAY_WIDTH - 16, 10, DISPLAY_COLOR_BLACK);
-            display_draw_text(8, 116, status, status_color, DISPLAY_COLOR_BLACK, 1);
+            display_fill_rect(8, UI_Y_STATUS_VAL, DISPLAY_WIDTH - 16, 10, DISPLAY_COLOR_BLACK);
+            display_draw_text(8, UI_Y_STATUS_VAL, status, status_color, DISPLAY_COLOR_BLACK, 1);
         }
 
         vTaskDelayUntil(&last_wake, period);

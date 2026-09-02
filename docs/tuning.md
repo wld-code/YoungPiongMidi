@@ -3,6 +3,49 @@
 Live findings from real-hardware bring-up, kept here instead of only in
 commit messages so they survive.
 
+## Pitch: ESP32-C5 has no hardware FPU - float YIN measured ~79ms/hop
+
+**Symptom observed on hardware**: after wiring up YIN (Milestone 3), the
+UI's level meter appeared to stop responding to voice, and the console
+showed repeated `audio_capture: output queue full, dropped a block`
+followed by a task-watchdog reset on `dsp_task`.
+
+**Measured, not assumed**: `audio_dsp`'s own pitch-stage timing (added
+alongside YIN specifically to measure this, per the project spec's
+"measure, don't claim" latency rule) showed the first all-`float`
+implementation of YIN's difference function costing **~79 ms average per
+hop**, against an 8 ms hop budget - roughly 10x over.
+
+**Cause**: ESP32-C5 is RISC-V `rv32imac` - no `f` (hardware
+single-precision float) extension. Confirmed in
+`components/soc/project_include.cmake`: ESP32-C5/C6/H2 get `rv32imac`,
+only ESP32-H4/P4 get `rv32imafc`. Every `float` multiply/add in YIN's
+O(window x tau_range) inner loop (~57,700 iterations/hop at the default
+window/tau settings) was therefore a soft-float library call - tens of
+cycles each - not a single hardware instruction.
+
+**Fix, in two steps**:
+1. Rewrote the difference function's hot inner loop in `int16_t` (Q14
+   fixed-point) samples accumulated in `int64_t`, which runs on the
+   core's native hardware-multiplier integer path. Kept only the cheap,
+   O(tau_range)-not-O(window x tau_range) normalization/threshold/
+   interpolation stages as float. Measured result: ~13 ms average / ~17ms
+   worst case - about 6x faster, but still over budget on its own.
+2. Added `YP_PITCH_UPDATE_STRIDE_HOPS` (default 3): the analysis window
+   still slides every hop, but the expensive CMNDF computation itself
+   only runs once every 3 hops (~24 ms), returning the last computed
+   estimate in between. Legitimate technique, not a shortcut - pitch
+   doesn't need 125 Hz updates. Measured result: `dsp_task` average
+   dropped to ~4.7 ms/hop, zero watchdog resets or dropped blocks over
+   sustained runs.
+
+**Takeaway**: don't estimate DSP cost on an MCU from "how many float ops"
+without first checking whether the target actually has a hardware FPU -
+the `-march` string in the toolchain file is the ground truth, and the
+gap between "should be sub-millisecond" and "measured 79ms" is exactly
+the soft-float tax. See docs/dsp.md's "Pitch detection" section for the
+full numbers and reasoning.
+
 ## Display: LCD power rail polarity was inverted
 
 **Symptom observed on hardware**: LCD physically connected, firmware

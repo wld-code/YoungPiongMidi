@@ -16,18 +16,20 @@ notes:
 ## What it does (current status)
 
 **Implemented and verified on real hardware**: continuous microphone
-acquisition (ADC continuous mode + DMA, no blocking one-shot reads),
-DC removal, high-pass and low-pass filtering, RMS, an attack/release
-envelope follower, and debounced voice-activity detection, all running as
-dedicated FreeRTOS tasks and displayed live on the on-board LCD plus
-rate-limited serial diagnostics.
+acquisition (ADC continuous mode + DMA, no blocking one-shot reads), DC
+removal, high-pass and low-pass filtering, RMS, an attack/release
+envelope follower, debounced voice-activity detection, and YIN
+fundamental-frequency (pitch) detection, all running as dedicated
+FreeRTOS tasks and displayed live on the on-board LCD plus rate-limited
+serial diagnostics.
 
-**Not yet implemented**: pitch detection, MIDI note generation, BLE/DIN
-MIDI output, dynamics-to-velocity/CC11 mapping, pitch bend. See "Roadmap"
-below and `docs/architecture.md` for the full milestone list. This is
-deliberate, incremental development, not an oversight - the project spec
-this firmware follows explicitly asks for acquisition to be proven on
-hardware before pitch detection is built on top of it.
+**Not yet implemented**: frequency -> MIDI note conversion, MIDI note
+generation, BLE/DIN MIDI output, dynamics-to-velocity/CC11 mapping, pitch
+bend. See "Roadmap" below and `docs/architecture.md` for the full
+milestone list. This is deliberate, incremental development, not an
+oversight - the project spec this firmware follows explicitly asks for
+each stage to be proven on hardware before the next is built on top of
+it.
 
 ## Hardware
 
@@ -52,7 +54,7 @@ ADC + DMA
     |
 Audio DSP (DC removal, HPF/LPF, RMS, envelope, VAD)
     |
-Pitch + Dynamics            <- pitch detection not yet implemented
+Pitch + Dynamics            <- pitch (YIN) done; note conversion not yet
     |
 Voice-to-MIDI Engine        <- not yet implemented
     |
@@ -72,7 +74,7 @@ components/
   board/            Pin definitions + central configuration
   audio_capture/    ADC continuous-mode acquisition
   audio_dsp/        RMS, envelope, voice-activity detection
-  pitch/            (placeholder - Milestone 3)
+  pitch/            YIN fundamental-frequency detection
   voice_midi/       (placeholder - Milestones 5-10)
   midi/             (placeholder - Milestones 5, 8-10)
   display/          ST7789P3 driver + UI primitives
@@ -105,32 +107,39 @@ USB-Serial/JTAG, so no external USB-UART bridge or drivers are needed.)
 
 Power the board (or plug it into a PC over USB) and watch the console:
 diagnostics print at a rate-limited interval (`YP_DEBUG_LOG_INTERVAL_MS`
-in `yp_config.h`) as `rms=... level=... voice_active=... clipped=...`, and
-the LCD shows a live level meter plus the same numbers. Speaking or
-singing into the microphone should move the level meter and eventually
-flip `voice_active` to 1. There is no MIDI output yet.
+in `yp_config.h`) as
+`pitch=...Hz confidence=... rms=... level=... voice_active=... clipped=...`,
+and the LCD shows the same pitch/confidence, a live level meter, and RMS/
+status. Speaking or singing into the microphone should move the level
+meter, flip `voice_active` to 1, and - for a sustained, clear pitch -
+show a frequency with confidence above `YP_PITCH_CONFIDENCE_THRESHOLD`
+(0.55 by default; below that the LCD shows `FREQ --- HZ` rather than a
+noisy guess). There is no MIDI output yet, and no frequency -> note name
+conversion yet either - the display shows raw Hz.
 
 ## Current status
 
-As of the last verification pass (see `docs/hardware.md` for details),
-this firmware was built, flashed, and run on a physical ESP-SensairShuttle
-v1.0 / ESP32-C5. It boots cleanly, initializes the display and
-microphone, and runs the acquisition + RMS/envelope/VAD pipeline
-continuously with no crashes and stable memory usage over multi-minute
-runs. Measured DSP processing time is ~325 us/frame and
-acquisition-to-analysis latency ~352 us - both well inside the project's
-end-to-end latency target, though this only covers the stages implemented
-so far.
+As of the last verification pass (see `docs/hardware.md` and
+`docs/tuning.md` for details), this firmware was built, flashed, and run
+on a physical ESP-SensairShuttle v1.0 / ESP32-C5. It boots cleanly,
+initializes the display and microphone, runs a boot self-test (LCD color
+cycle + speaker melody), and runs the acquisition + RMS/envelope/VAD/YIN
+pitch pipeline continuously with no crashes and stable memory usage over
+multi-minute runs. Measured `dsp_task` time per hop is ~4.7 ms average
+(worst case ~13 ms on the 1-in-3 hops that run the full YIN analysis,
+absorbed by the capture queue) - see docs/dsp.md for how that number was
+arrived at, including a real finding along the way: ESP32-C5 has no
+hardware FPU, and the first all-`float` YIN implementation measured
+~79 ms/hop before being rewritten in fixed-point.
 
-**LCD note**: the panel initially showed nothing at all when first
-connected - traced (via Espressif's own mainboard schematic, not a guess)
-to `GPIO5`/`PWR_CTRL` being an active-**low** power-rail switch, driven
-active-high in the first firmware revision. Fixed and reflashed; the fix
-also happened to resolve an earlier `clipped` finding that had been
-(incorrectly) attributed to the microphone - see `docs/hardware.md` and
-`docs/tuning.md` for the full story. Still needs eyes-on confirmation that
-the panel now actually displays the UI, since this session cannot see the
-board.
+Two other real bring-up findings worth knowing about, both already fixed
+and documented in `docs/hardware.md`/`docs/tuning.md`: the LCD initially
+showed nothing because `GPIO5`/`PWR_CTRL` is an active-**low** power-rail
+switch (traced via Espressif's own schematic, not guessed) that the first
+firmware revision drove backwards; and the microphone's `clipped` flag
+was stuck true until that same LCD fix, most likely because the
+unpowered-but-still-clocked panel was coupling noise into the analog
+front-end.
 
 ## Roadmap
 
@@ -138,7 +147,7 @@ board.
 |---|---|---|
 | 1 | Continuous mic acquisition + basic signal display | Done |
 | 2 | RMS/envelope + voice activity detection | Done |
-| 3 | Fundamental frequency detection (YIN) | Planned |
+| 3 | Fundamental frequency detection (YIN) | Done |
 | 4 | Frequency -> MIDI note conversion | Planned |
 | 5 | MIDI Note On/Off generation | Planned |
 | 6 | Vocal dynamics -> MIDI velocity | Planned |

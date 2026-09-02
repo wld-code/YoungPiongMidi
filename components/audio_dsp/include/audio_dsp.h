@@ -1,19 +1,17 @@
 /**
  * @file audio_dsp.h
  * @brief Per-hop voice analysis: optional low-pass smoothing, RMS,
- *        envelope following and voice-activity detection.
+ *        envelope following, voice-activity detection, and pitch.
  *
  * Pipeline position (see docs/dsp.md):
  *
  *   audio_capture (DC removal, HPF, normalize)
- *     -> audio_dsp: optional LPF -> RMS -> envelope -> VAD -> [pitch]
+ *     -> audio_dsp: optional LPF -> RMS -> envelope -> VAD -> pitch
  *
- * Pitch detection (component `pitch`) is a separate, independently
- * replaceable stage; this component's job stops at "is there voice, and
- * how loud is it". voice_analysis_t already carries frequency_hz/
- * confidence fields so the interface does not change shape when pitch
- * detection lands (Milestone 3) - until then this component always
- * reports frequency_hz = 0 and confidence = 0.
+ * Pitch detection itself lives in the separate, independently replaceable
+ * `pitch` component (currently YIN, see pitch/yin.c) - this file only
+ * calls into it and merges its result into voice_analysis_t, once per
+ * hop, timed for the latency stats in docs/hardware.md/tuning.md.
  */
 #pragma once
 
@@ -27,8 +25,14 @@ extern "C" {
 #endif
 
 typedef struct {
-    float frequency_hz;   /**< 0 until the pitch component is integrated. */
-    float confidence;     /**< 0..1, 0 until the pitch component is integrated. */
+    /** YIN pitch estimate, Hz. 0 if the analysis window hasn't filled yet
+     *  (first ~YP_AUDIO_FRAME_SIZE/YP_AUDIO_HOP_SIZE hops after init).
+     *  Always check `confidence` before trusting this for anything - a
+     *  low-confidence value is still a real (if unreliable) estimate,
+     *  not a sentinel. */
+    float frequency_hz;
+    /** 0..1. Compare against YP_PITCH_CONFIDENCE_THRESHOLD. */
+    float confidence;
     float rms;            /**< Raw per-hop RMS, ~0..1. */
     float level;          /**< Envelope-followed amplitude, ~0..1. */
     bool  voice_active;   /**< Debounced voice-activity flag. */

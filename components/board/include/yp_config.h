@@ -78,6 +78,18 @@ extern "C" {
  *  a pitch estimate is considered usable by the note state machine. */
 #define YP_PITCH_CONFIDENCE_THRESHOLD  0.55f
 
+/** Run the (expensive) YIN analysis once every this many hops, rather
+ *  than every hop. The analysis window still slides every hop (no audio
+ *  is skipped), only the O(window x tau_range) computation itself is
+ *  decimated - reasonable because pitch does not need to update at the
+ *  8ms hop rate: even fast vocal vibrato is ~5-8 Hz, far below the
+ *  ~1000/3 = 333 Hz+ effective update rate this still gives. Needed in
+ *  practice, not just in theory: measured on real ESP32-C5 hardware
+ *  (no hardware FPU - see yin.c's header comment), the fixed-point YIN
+ *  computation itself costs ~13ms average / ~17ms worst case, still over
+ *  the raw 8ms hop budget on its own. See docs/tuning.md. */
+#define YP_PITCH_UPDATE_STRIDE_HOPS    3
+
 /* -------------------------------------------------------------------- */
 /*  Voice activity / envelope                                            */
 /* -------------------------------------------------------------------- */
