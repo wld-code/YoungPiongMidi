@@ -5,6 +5,63 @@
 Live findings from real-hardware bring-up, kept here instead of only in
 commit messages so they survive.
 
+## False MIDI triggering from touching the mic / ambient noise
+
+**What the user reported**: touching the microphone, or just ambient
+room noise with no one singing or speaking, was generating real
+`NOTE_ON`/`CC`/`NOTE_OFF` events - confirmed in this session's own
+hardware logs across many runs: confidence regularly spiking above 0.9
+on pure noise, `state=NOTE_ACTIVE` firing with no voice present.
+
+**Root cause, in two parts**:
+
+1. **The high-pass filter was too weak for what it needed to reject.**
+   `audio_capture.c`'s conditioning used a 1-pole (single RC-style) IIR
+   high-pass filter, which only rolls off at -6 dB/octave below its
+   cutoff - a gentle slope. Touching the microphone produces broadband
+   mechanical/handling noise strongest at very low frequency; a gentle
+   filter barely dented it, and what got through still carried enough
+   spurious low-frequency structure for YIN to occasionally read as
+   "periodic enough" (high confidence on something that wasn't a voice
+   at all).
+2. **The voice-activity threshold was a fixed number
+   (`YP_VAD_RMS_THRESHOLD = 0.02`)**, not adapted to this board's actual
+   ambient/electrical noise floor. Real hardware logs throughout this
+   project's development consistently showed RMS sitting in the
+   0.001-0.03 range even in a "quiet" room - straddling that fixed
+   threshold, so it barely distinguished real signal from ambient noise
+   at all.
+
+**Fix, matching both causes**:
+
+1. `audio_capture.c`'s high-pass filter is now a proper 2nd-order
+   (biquad, RBJ cookbook formula, Butterworth Q) IIR - a real
+   -12dB/octave rolloff below cutoff, not a style upgrade. Coefficients
+   are computed once at init (`cosf`/`sinf`, not cheap, but not in the
+   per-sample path either - the same "float only where it's not the hot
+   loop" rule this project applies everywhere, see
+   docs/tutorials/03-pitch-detection-yin.md); the per-sample cost is
+   just 5 multiplies + 4 adds (Direct Form I), negligible.
+2. New `components/audio_dsp/noise_gate.c`: replaces the fixed VAD
+   threshold with a slow follower that continuously tracks the ambient
+   noise floor - the same idea as a studio noise gate or a radio
+   squelch (see noise_gate.c and yp_config.h's `YP_NOISE_GATE_*` block
+   for the full reasoning). Critically, the floor only adapts *upward*
+   while the
+   gate is *closed* - a loud, real, sustained voice can never drag its
+   own threshold up out from under it, but noise the gate never trusted
+   in the first place slowly raises the bar until it stops looking like
+   signal. 9 host-test checks in `test/test_noise_gate.c` cover this
+   asymmetry directly (`test_loud_open_gate_does_not_raise_floor`,
+   `test_closed_gate_noise_eventually_raises_floor`).
+
+**Verified on hardware**: a 20-second capture of the same ambient
+conditions that previously produced multiple false `NOTE_ON` events
+during every comparable test in this project's history now shows
+`state=SILENCE` for the entire run, confidence pinned near 0.00, and
+**zero** MIDI events - with no change to DSP timing (~4.7-4.8ms/hop
+average, same as every prior measurement) or memory usage.
+
 ## Onboard synth: audio audibly lagged the MIDI log by ~90ms
 
 **What the user reported**: after `components/midi/onboard_synth.c`

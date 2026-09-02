@@ -10,7 +10,7 @@ ADC raw sample (12-bit)
     v
 DC removal (slow exponential tracker, alpha=0.001)
     v
-High-pass filter (one-pole IIR, YP_AUDIO_HPF_CUTOFF_HZ = 60 Hz)
+High-pass filter (2nd-order biquad IIR, YP_AUDIO_HPF_CUTOFF_HZ = 60 Hz)
     v
 Normalize (/2048, clamp to [-1, 1])
     |  -> audio_block_t, YP_AUDIO_HOP_SIZE (128) samples, over a queue
@@ -23,15 +23,20 @@ RMS over the hop                                                   [rms.c]
     v
 Envelope follower (attack 8 ms / release 120 ms)                   [envelope.c]
     v
+Adaptive noise gate threshold (tracks ambient floor)             [noise_gate.c]
+    v
 Voice-activity detection (debounced: 2 frames to trigger,
                            4 frames to release)                    [audio_dsp.c]
     v
-voice_analysis_t { frequency_hz=0, confidence=0, rms, level, voice_active }
+YIN pitch detection (decimated - see "Pitch detection" below)        [pitch/]
+    v
+voice_analysis_t { frequency_hz, confidence, rms, level, voice_active }
 ```
 
-`frequency_hz` and `confidence` are always 0 today; they exist in the
-struct now so integrating the pitch detector (Milestone 3) does not change
-`voice_analysis_t`'s shape, only who fills in those two fields.
+All fields of `voice_analysis_t` are live today - pitch detection
+(Milestone 3), the note-stabilization state machine, dynamics mapping,
+and CC11 expression (Milestones 4-7) are all implemented; see
+`docs/architecture.md`'s roadmap table for current status.
 
 ## Why DC removal and the HPF are split into two stages
 
@@ -78,13 +83,39 @@ constants.
 ## Voice activity detection
 
 Two independent debounce counters (`YP_VAD_ATTACK_FRAMES` = 2,
-`YP_VAD_RELEASE_FRAMES` = 4) against a single RMS threshold
-(`YP_VAD_RMS_THRESHOLD` = 0.02) prevent single-frame noise spikes or
-dropouts from toggling `voice_active`. This is intentionally simpler than
-the full note-stabilization state machine described in the project spec's
-section 7 (SILENCE/ATTACK/NOTE_ACTIVE/NOTE_CHANGE/RELEASE) - that state
-machine belongs to Milestone 5+ (`voice_midi`, not yet implemented) and
-operates on *note* stability, not just voice-present/absent.
+`YP_VAD_RELEASE_FRAMES` = 4) require several consecutive frames above or
+below threshold before flipping `voice_active`, preventing single-frame
+noise spikes or dropouts from toggling it. The threshold itself is *not*
+a fixed number - see "Adaptive noise gate" below, added after real
+hardware showed a fixed threshold let ambient noise and mic-handling
+noise through. This VAD stage is intentionally simpler than the full
+note-stabilization state machine in `components/voice_midi` (see
+`docs/midi.md`) - that operates on *note* stability once a pitch exists;
+this just decides whether there's a signal worth analyzing at all.
+
+## Adaptive noise gate
+
+`components/audio_dsp/noise_gate.c` replaces what was originally a fixed
+VAD threshold with one that tracks the ambient noise floor continuously
+and adapts to it - the same idea as a studio noise gate or a radio
+squelch. A slow follower (`YP_NOISE_GATE_DOWN_TIME_MS` = 1000ms to adapt
+toward quiet, `YP_NOISE_GATE_UP_TIME_MS` = 30000ms to adapt toward
+louder) tracks `floor`; the actual gate threshold used by VAD is
+`floor * YP_NOISE_GATE_MARGIN_RATIO` (2.5x, clamped to at least
+`YP_NOISE_GATE_MIN_FLOOR`).
+
+The one property that makes this work rather than just being a slower
+fixed threshold: the floor only adapts *upward* while the gate is
+*closed* (`noise_gate_process()`'s `gate_was_open` parameter). A loud,
+sustained, real voice keeps the gate open and therefore can never drag
+its own threshold up underneath itself - but a persistent noise source
+the gate never trusted (handling noise, hum) slowly raises the bar until
+it stops registering as signal at all. This asymmetry is directly tested
+in `test/test_noise_gate.c`
+(`test_loud_open_gate_does_not_raise_floor`,
+`test_closed_gate_noise_eventually_raises_floor`) and was necessary on
+real hardware, not theoretical - see docs/tuning.md for the measured
+before/after.
 
 ## Pitch detection (Milestone 3, implemented)
 

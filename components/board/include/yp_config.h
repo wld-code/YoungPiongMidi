@@ -52,7 +52,16 @@ extern "C" {
  *  observed. */
 #define YP_AUDIO_ADC_ATTEN             ADC_ATTEN_DB_12
 
-/** High-pass filter cutoff used to remove DC and rumble before analysis. */
+/** High-pass filter cutoff used to remove DC and rumble before analysis.
+ *  Implemented as a 2nd-order (biquad) IIR, not a 1-pole filter - a
+ *  1-pole filter's gentle -6dB/octave rolloff barely dented real
+ *  mechanical/handling noise from touching the microphone (which is
+ *  broadband but strongest at very low frequency); the -12dB/octave
+ *  rolloff of a proper 2nd-order filter is a real, measured-necessary
+ *  strengthening, not a stylistic choice - see docs/tuning.md. Q is
+ *  fixed at 1/sqrt(2) (Butterworth - maximally flat passband), the
+ *  standard choice for a single biquad section, so it isn't a separate
+ *  macro. */
 #define YP_AUDIO_HPF_CUTOFF_HZ         60.0f
 
 /** Optional low-pass filter cutoff (anti-alias / hiss reduction) applied
@@ -94,18 +103,57 @@ extern "C" {
 /*  Voice activity / envelope                                            */
 /* -------------------------------------------------------------------- */
 
-/** RMS (0..1 normalized) below which the signal is considered silence. */
-#define YP_VAD_RMS_THRESHOLD           0.02f
-
 /** Number of consecutive frames above threshold required to declare voice
  *  active, and below threshold required to declare silence. Debounces
- *  short transients. */
+ *  short transients. Works together with the adaptive noise gate below -
+ *  this handles "don't trust one frame", the gate handles "what counts
+ *  as loud enough to trust at all". */
 #define YP_VAD_ATTACK_FRAMES           2
 #define YP_VAD_RELEASE_FRAMES          4
 
 /** Envelope follower time constants, in milliseconds. */
 #define YP_ENVELOPE_ATTACK_MS          8.0f
 #define YP_ENVELOPE_RELEASE_MS         120.0f
+
+/* -------------------------------------------------------------------- */
+/*  Adaptive noise gate                                                  */
+/* -------------------------------------------------------------------- */
+
+/** Real hardware/rooms have a real, non-zero, non-constant noise floor
+ *  (electrical hum, fan noise, handling the microphone) - a *fixed*
+ *  RMS threshold either lets that noise through (set too low) or misses
+ *  quiet real speech (set too high), and cannot adapt if the ambient
+ *  level changes. Confirmed on real hardware: touching the microphone,
+ *  or just ambient room noise, was crossing a fixed threshold and
+ *  generating real MIDI events with no one singing - see docs/tuning.md.
+ *
+ *  The fix is the same one a studio noise gate or a radio squelch uses:
+ *  a slow follower continuously tracks the ambient floor, and the
+ *  actual gate threshold is that floor times a margin, not a constant.
+ *  See noise_gate.c. */
+
+/** Time constant (ms) for the floor tracker adapting DOWNWARD, toward a
+ *  quieter room - fast enough to find true silence within about this
+ *  long after it starts. */
+#define YP_NOISE_GATE_DOWN_TIME_MS     1000.0f
+
+/** Time constant (ms) for the floor tracker adapting UPWARD -
+ *  deliberately much slower than the down time constant, and only
+ *  applied while the gate is currently *closed* (see noise_gate.c), so
+ *  a loud, real voice can never drag the floor up. Still lets the floor
+ *  eventually follow a genuinely noisier environment (e.g. an AC unit
+ *  turning on) rather than staying stuck low forever. */
+#define YP_NOISE_GATE_UP_TIME_MS       30000.0f
+
+/** How far above the tracked noise floor the signal must rise before
+ *  the gate opens, as a linear ratio (not dB - ~2.5x is approximately
+ *  +8 dB). Higher = more resistant to noise, but also to quiet speech. */
+#define YP_NOISE_GATE_MARGIN_RATIO     2.5f
+
+/** Absolute floor safety clamp: the adaptive floor is never allowed to
+ *  track below this, so the gate threshold can't collapse toward zero
+ *  during genuine silence and become hypersensitive to any tiny noise. */
+#define YP_NOISE_GATE_MIN_FLOOR        0.006f
 
 /* -------------------------------------------------------------------- */
 /*  Note stabilization state machine                                     */

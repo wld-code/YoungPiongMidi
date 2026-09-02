@@ -33,9 +33,13 @@ static volatile bool s_running;
 
 /* --- signal conditioning state (single mono channel) ------------------ */
 static float s_dc_estimate;
-static float s_hpf_prev_in;
-static float s_hpf_prev_out;
-static float s_hpf_alpha;
+
+/* 2nd-order (biquad) high-pass filter state and coefficients - Direct
+ * Form I. See the big comment on condition_sample() below for why this
+ * replaced a 1-pole filter. */
+static float s_hpf_x1, s_hpf_x2;   /* x[n-1], x[n-2] */
+static float s_hpf_y1, s_hpf_y2;   /* y[n-1], y[n-2] */
+static float s_hpf_b0, s_hpf_b1, s_hpf_b2, s_hpf_a1, s_hpf_a2;
 
 /* Assembly buffer for the block currently being filled. */
 static audio_block_t s_building;
@@ -44,12 +48,34 @@ static size_t s_building_count;
 static void conditioning_reset(void)
 {
     s_dc_estimate = 2048.0f; /* mid-scale guess; converges quickly */
-    s_hpf_prev_in = 0.0f;
-    s_hpf_prev_out = 0.0f;
 
-    float dt = 1.0f / (float)YP_AUDIO_SAMPLE_RATE_HZ;
-    float rc = 1.0f / (2.0f * (float)M_PI * YP_AUDIO_HPF_CUTOFF_HZ);
-    s_hpf_alpha = rc / (rc + dt);
+    s_hpf_x1 = s_hpf_x2 = 0.0f;
+    s_hpf_y1 = s_hpf_y2 = 0.0f;
+
+    /* RBJ cookbook high-pass biquad, Q = 1/sqrt(2) (Butterworth -
+     * maximally flat passband, the standard choice absent a reason to
+     * pick otherwise). Coefficients computed once here (trig is not
+     * cheap, but this runs once at init, never in the per-sample path
+     * below), matching the same "float only where it's not the hot
+     * loop" rule this project applies to YIN's difference function -
+     * see docs/tutorials/03-pitch-detection-yin.md. */
+    const float Q = 0.70710678f;
+    float w0 = 2.0f * (float)M_PI * YP_AUDIO_HPF_CUTOFF_HZ / (float)YP_AUDIO_SAMPLE_RATE_HZ;
+    float cosw0 = cosf(w0);
+    float alpha = sinf(w0) / (2.0f * Q);
+
+    float b0 = (1.0f + cosw0) / 2.0f;
+    float b1 = -(1.0f + cosw0);
+    float b2 = (1.0f + cosw0) / 2.0f;
+    float a0 = 1.0f + alpha;
+    float a1 = -2.0f * cosw0;
+    float a2 = 1.0f - alpha;
+
+    s_hpf_b0 = b0 / a0;
+    s_hpf_b1 = b1 / a0;
+    s_hpf_b2 = b2 / a0;
+    s_hpf_a1 = a1 / a0;
+    s_hpf_a2 = a2 / a0;
 }
 
 /**
@@ -59,9 +85,19 @@ static void conditioning_reset(void)
  *  1. DC offset removal: a very slow exponential tracker of the signal's
  *     mean, subtracted out. Handles bias-point drift with temperature/
  *     supply, not just the nominal mid-scale bias.
- *  2. High-pass filter: a standard one-pole IIR at YP_AUDIO_HPF_CUTOFF_HZ,
- *     removing rumble/handling noise the DC tracker alone would not (it
- *     only removes near-0 Hz content).
+ *  2. High-pass filter: a 2nd-order (biquad) IIR at
+ *     YP_AUDIO_HPF_CUTOFF_HZ, removing rumble/handling noise the DC
+ *     tracker alone would not (it only removes near-0 Hz content).
+ *     Confirmed necessary on real hardware, not a guess: touching the
+ *     microphone produces broadband mechanical noise strongest at very
+ *     low frequency, and a 1st-order filter's gentle -6dB/octave
+ *     rolloff barely attenuated it - real MIDI events kept firing with
+ *     no one singing. A 2nd-order filter's -12dB/octave rolloff is a
+ *     real fix, not a style upgrade - see docs/tuning.md. This is only
+ *     half of that fix; see audio_dsp.c's adaptive noise gate for the
+ *     other half (rejecting whatever handling noise gets past this
+ *     filter, and ambient/electrical noise this filter was never meant
+ *     to touch).
  */
 static float condition_sample(uint32_t raw12, bool *out_near_rail)
 {
@@ -72,14 +108,18 @@ static float condition_sample(uint32_t raw12, bool *out_near_rail)
     s_dc_estimate += kDcTrackerAlpha * ((float)raw12 - s_dc_estimate);
     float dc_removed = (float)raw12 - s_dc_estimate;
 
-    /* 2. High-pass filter */
-    float y = s_hpf_alpha * (s_hpf_prev_out + dc_removed - s_hpf_prev_in);
-    s_hpf_prev_in = dc_removed;
-    s_hpf_prev_out = y;
+    /* 2. High-pass filter (Direct Form I biquad) */
+    float x0 = dc_removed;
+    float y0 = s_hpf_b0 * x0 + s_hpf_b1 * s_hpf_x1 + s_hpf_b2 * s_hpf_x2
+               - s_hpf_a1 * s_hpf_y1 - s_hpf_a2 * s_hpf_y2;
+    s_hpf_x2 = s_hpf_x1;
+    s_hpf_x1 = x0;
+    s_hpf_y2 = s_hpf_y1;
+    s_hpf_y1 = y0;
 
     /* 3. Normalize. Half of the 12-bit range approximates full-scale swing
      *    around the analog front-end's bias point. */
-    float normalized = y / 2048.0f;
+    float normalized = y0 / 2048.0f;
     if (normalized > 1.0f) normalized = 1.0f;
     if (normalized < -1.0f) normalized = -1.0f;
     return normalized;

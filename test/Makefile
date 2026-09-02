@@ -27,7 +27,7 @@ INCLUDES := -I. -I$(BOARD_INC) -I$(DSP_DIR) -I$(PITCH_INC) -I$(VMIDI_INC)
 
 BUILD := build
 
-TESTS := test_midi_notes test_rms test_envelope test_pitch test_note_state_machine test_dynamics test_expression
+TESTS := test_midi_notes test_rms test_envelope test_pitch test_note_state_machine test_dynamics test_expression test_noise_gate
 
 .PHONY: test all clean
 test: all
@@ -70,6 +70,9 @@ $(BUILD)/test_dynamics: test_dynamics.c $(VMIDI_DIR)/voice_midi.c test_common.h 
 
 $(BUILD)/test_expression: test_expression.c $(VMIDI_DIR)/voice_midi.c $(VMIDI_DIR)/expression.c test_common.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_expression.c $(VMIDI_DIR)/voice_midi.c $(VMIDI_DIR)/expression.c $(LDLIBS)
+
+$(BUILD)/test_noise_gate: test_noise_gate.c $(DSP_DIR)/noise_gate.c test_common.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_noise_gate.c $(DSP_DIR)/noise_gate.c $(LDLIBS)
 
 clean:
 	rm -rf $(BUILD)
