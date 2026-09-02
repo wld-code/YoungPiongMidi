@@ -1,4 +1,5 @@
 idf_component_register(
-    SRCS "voice_midi.c"
+    SRCS "voice_midi.c" "note_state_machine.c"
     INCLUDE_DIRS "include"
+    REQUIRES board
 )

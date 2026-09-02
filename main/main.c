@@ -4,8 +4,10 @@
  *
  * Current milestones implemented: 1 (continuous microphone acquisition +
  * basic signal display), 2 (RMS/envelope + voice activity detection),
- * 3 (YIN fundamental frequency detection - see components/pitch), and
- * 4 (frequency -> MIDI note conversion - see components/voice_midi).
+ * 3 (YIN fundamental frequency detection - see components/pitch),
+ * 4 (frequency -> MIDI note conversion - see components/voice_midi), and
+ * 5 (note-stabilization state machine + MIDI Note On/Off generation -
+ * see components/voice_midi/note_state_machine.c and components/midi).
  * See docs/architecture.md for the full roadmap and README.md for status.
  *
  * Task layout (see docs/architecture.md "FreeRTOS architecture" for the
@@ -13,8 +15,14 @@
  *
  *   audio_capture task (owned by the audio_capture component)
  *     -> [audio_block_t queue]
- *   dsp_task (this file): RMS / envelope / VAD, latency instrumentation
- *     -> [mutex-guarded latest voice_analysis_t]
+ *   dsp_task (this file): RMS / envelope / VAD / pitch, then the note
+ *   state machine + midi_send_*() calls run inline here too (see the
+ *   "why not its own task" note above dsp_task's note-machine call) -
+ *     -> [mutex-guarded latest voice_analysis_t] (for ui_task)
+ *     -> [midi_event_t queue, owned by the midi component] (for midi_task)
+ *   midi_task (owned by the midi component): dequeues MIDI events,
+ *     dispatches to enabled transports (currently: a diagnostic log only
+ *     - see docs/midi.md)
  *   ui_task (this file): LCD refresh, decoupled from the DSP loop
  */
 #include <stdio.h>
@@ -33,6 +41,7 @@
 #include "display.h"
 #include "self_test.h"
 #include "voice_midi.h"
+#include "midi.h"
 
 static const char *TAG = "main";
 
@@ -45,6 +54,10 @@ static const char *TAG = "main";
 static SemaphoreHandle_t s_state_mutex;
 static voice_analysis_t s_latest_analysis;
 static bool s_latest_clipped;
+
+/* Owned by dsp_task alone (single writer, no locking needed) - see the
+ * "why not its own task" reasoning in the file header comment. */
+static yp_note_sm_t s_note_sm;
 
 /* -------------------------------------------------------------------- */
 /*  dsp_task: consumes audio blocks, runs the DSP pipeline, publishes    */
@@ -89,19 +102,59 @@ static void dsp_task(void *arg)
             xSemaphoreGive(s_state_mutex);
         }
 
+        /* Note-stabilization state machine + MIDI event generation
+         * (Milestone 5). Runs inline in dsp_task rather than its own
+         * task/queue hand-off: yp_note_sm_process() is a handful of
+         * float comparisons, not DSP - see docs/architecture.md for why
+         * that's a deliberate reading of "do not create unnecessary
+         * tasks" rather than a shortcut. midi_send_*() itself only does
+         * a non-blocking queue send, so this cannot stall the audio
+         * pipeline the way a slow transport could. */
+        yp_voice_frame_t frame = {
+            .frequency_hz = analysis.frequency_hz,
+            .confidence = analysis.confidence,
+            .level = analysis.level,
+            .voice_active = analysis.voice_active,
+        };
+        yp_note_event_t note_event = yp_note_sm_process(&s_note_sm, &frame, t_process_end);
+        switch (note_event.type) {
+            case YP_NOTE_EVENT_NOTE_ON:
+                midi_send_note_on(YP_MIDI_CHANNEL, note_event.note_on_number, note_event.velocity);
+                break;
+            case YP_NOTE_EVENT_NOTE_OFF:
+                midi_send_note_off(YP_MIDI_CHANNEL, note_event.note_off_number, 0);
+                break;
+            case YP_NOTE_EVENT_NOTE_CHANGE:
+                midi_send_note_off(YP_MIDI_CHANNEL, note_event.note_off_number, 0);
+                midi_send_note_on(YP_MIDI_CHANNEL, note_event.note_on_number, note_event.velocity);
+                break;
+            case YP_NOTE_EVENT_NONE:
+            default:
+                break;
+        }
+
         int64_t now = t_process_end;
 
         if (YP_DEBUG_VOICE_LOG && (now - last_log_us) >= (YP_DEBUG_LOG_INTERVAL_MS * 1000)) {
             last_log_us = now;
+            /* One-hop-only labels for the transitions the state machine
+             * doesn't persist (see note_state_machine.c) - shown only on
+             * the exact hop they fired, otherwise the persisted state. */
+            const char *state_label = yp_note_state_name(s_note_sm.state);
+            if (note_event.type == YP_NOTE_EVENT_NOTE_ON) state_label = "ATTACK";
+            else if (note_event.type == YP_NOTE_EVENT_NOTE_CHANGE) state_label = "NOTE_CHANGE";
+            else if (note_event.type == YP_NOTE_EVENT_NOTE_OFF) state_label = "RELEASE";
+
             if (analysis.confidence >= YP_PITCH_CONFIDENCE_THRESHOLD && analysis.frequency_hz > 0.0f) {
                 yp_note_info_t note = yp_frequency_to_note_info(analysis.frequency_hz);
-                ESP_LOGI(TAG, "pitch=%.1fHz note=%s%d midi=%d cents=%.1f confidence=%.2f rms=%.4f level=%.4f voice_active=%d clipped=%d",
+                int velocity = yp_level_to_velocity(analysis.level, (yp_vel_curve_t)YP_DEFAULT_VELOCITY_CURVE);
+                ESP_LOGI(TAG, "pitch=%.1fHz note=%s%d midi=%d cents=%.1f confidence=%.2f rms=%.4f velocity=%d state=%s clipped=%d",
                          analysis.frequency_hz, note.note_name, note.octave, note.midi_note, note.cents,
-                         analysis.confidence, analysis.rms, analysis.level, analysis.voice_active, block.clipped);
+                         analysis.confidence, analysis.rms, velocity, state_label, block.clipped);
             } else {
-                ESP_LOGI(TAG, "pitch=%.1fHz note=--- confidence=%.2f rms=%.4f level=%.4f voice_active=%d clipped=%d",
+                ESP_LOGI(TAG, "pitch=%.1fHz note=--- confidence=%.2f rms=%.4f level=%.4f state=%s clipped=%d",
                          analysis.frequency_hz, analysis.confidence,
-                         analysis.rms, analysis.level, analysis.voice_active, block.clipped);
+                         analysis.rms, analysis.level, state_label, block.clipped);
             }
         }
 
@@ -234,6 +287,8 @@ void app_main(void)
 
     ESP_ERROR_CHECK(audio_dsp_init());
     ESP_ERROR_CHECK(audio_capture_init());
+    ESP_ERROR_CHECK(midi_init());
+    yp_note_sm_init(&s_note_sm);
 
     s_state_mutex = xSemaphoreCreateMutex();
     if (!s_state_mutex) {

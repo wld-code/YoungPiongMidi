@@ -69,3 +69,31 @@ yp_note_info_t yp_frequency_to_note_info(float frequency_hz)
 
     return info;
 }
+
+int yp_level_to_velocity(float level, yp_vel_curve_t curve)
+{
+    float clamped = level;
+    if (clamped < YP_DYNAMICS_NOISE_FLOOR) clamped = YP_DYNAMICS_NOISE_FLOOR;
+    if (clamped > YP_DYNAMICS_MAX_RMS) clamped = YP_DYNAMICS_MAX_RMS;
+
+    float normalized; /* 0..1 */
+    if (curve == YP_VEL_CURVE_LOG) {
+        /* Linear in dB, not in level: quiet-to-medium changes get
+         * proportionally more of the velocity range, tracking perceived
+         * loudness better than a raw linear mapping (see voice_midi.h). */
+        float db_min = 20.0f * log10f(YP_DYNAMICS_NOISE_FLOOR);
+        float db_max = 20.0f * log10f(YP_DYNAMICS_MAX_RMS);
+        float db = 20.0f * log10f(clamped);
+        normalized = (db - db_min) / (db_max - db_min);
+    } else {
+        normalized = (clamped - YP_DYNAMICS_NOISE_FLOOR) / (YP_DYNAMICS_MAX_RMS - YP_DYNAMICS_NOISE_FLOOR);
+    }
+    if (normalized < 0.0f) normalized = 0.0f;
+    if (normalized > 1.0f) normalized = 1.0f;
+
+    int velocity = YP_MIDI_VELOCITY_MIN
+                    + (int)lroundf(normalized * (float)(YP_MIDI_VELOCITY_MAX - YP_MIDI_VELOCITY_MIN));
+    if (velocity < YP_MIDI_VELOCITY_MIN) velocity = YP_MIDI_VELOCITY_MIN;
+    if (velocity > YP_MIDI_VELOCITY_MAX) velocity = YP_MIDI_VELOCITY_MAX;
+    return velocity;
+}

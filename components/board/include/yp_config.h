@@ -185,10 +185,13 @@ typedef enum {
 /** MIDI event queue depth between voice_midi_task and midi_task. */
 #define YP_MIDI_QUEUE_LENGTH           32
 
-/* Transports. BLE MIDI is the default/primary transport; DIN MIDI over
- * UART is optional and off until a UART TX pin is confirmed for a given
- * hardware revision (see docs/hardware.md). */
-#define YP_MIDI_BLE_ENABLED            1
+/* Transports. Both start disabled: BLE MIDI (Milestone 8) and DIN MIDI
+ * over UART (Milestone 9, additionally blocked on a confirmed TX pin -
+ * see docs/hardware.md) are not implemented yet. Until at least one of
+ * these is 1, midi_task's only "transport" is a diagnostic log line per
+ * event - see docs/midi.md. Flip YP_MIDI_BLE_ENABLED to 1 once
+ * components/midi/midi_ble.c exists. */
+#define YP_MIDI_BLE_ENABLED            0
 #define YP_MIDI_UART_ENABLED           0
 #define YP_MIDI_UART_BAUD              31250
 

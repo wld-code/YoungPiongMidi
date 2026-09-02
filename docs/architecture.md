@@ -44,13 +44,20 @@ components/
                  {frequency_hz,confidence}-out interface so it stays
                  swappable for a different algorithm later.
   voice_midi/    Frequency<->MIDI note conversion (Milestone 4, done -
-                 see voice_midi.c/.h: pure math, no ESP-IDF dependency,
-                 host-tested in test/test_midi_notes.c). Note
-                 stabilization state machine + dynamics->MIDI mapping
-                 (Milestones 5-10) not yet implemented - will land in
-                 note_state_machine.c alongside this file.
-  midi/          Not yet implemented (Milestones 8-9). Transport-
-                 independent MIDI event queue + BLE/UART backends.
+                 voice_midi.c/.h), dynamics->velocity mapping (Milestone
+                 6, partially - see docs/midi.md), and the note-
+                 stabilization state machine (Milestone 5, done -
+                 note_state_machine.c). All pure math/state, no ESP-IDF
+                 dependency, host-tested (test/test_midi_notes.c,
+                 test/test_note_state_machine.c: 429 checks between
+                 them). Decides *when*/*what* a MIDI event should be,
+                 never touches a queue or transport itself.
+  midi/          Transport-independent MIDI event queue + midi_task
+                 (Milestone 5, done - midi.h/.c): builds midi_event_t
+                 from voice_midi's decisions and dispatches to whichever
+                 transport(s) are enabled. Neither is yet (Milestones
+                 8-9), so the only "transport" today is a diagnostic log
+                 line per event - see docs/midi.md.
   display/       Direct-SPI ST7789P3 driver + tiny bitmap-font UI
                  primitives. Deliberately not a full LVGL/esp_lcd_panel
                  stack - the UI need (section 13 of the spec) is a
@@ -58,16 +65,17 @@ components/
                  not a general-purpose GUI.
 main/            Task wiring: creates dsp_task and ui_task, starts
                  acquisition, owns the mutex-guarded "latest analysis"
-                 hand-off between them.
+                 hand-off between them. dsp_task also drives the note
+                 state machine and calls midi_send_*() - see "FreeRTOS
+                 architecture" below for why that's inline rather than
+                 its own task.
 ```
 
-`components/midi` exists as a directory (matching the repository layout
-the project spec asks for) but currently contains only a README pointing
-back here - see "Roadmap" below; nothing in `main/` references it yet.
-`components/pitch` and `components/voice_midi` are implemented (see
-above) - `voice_midi` currently holds only frequency<->MIDI conversion
-(voice_midi.c); its future note_state_machine.c (Milestones 5+) does not
-exist yet.
+`components/pitch`, `components/voice_midi` and `components/midi` are
+all implemented now (see above). `voice_midi`'s note_state_machine.c
+covers Milestone 5 and part of Milestone 6 (velocity only, not
+attack-vs-sustain dynamics or CC11); Milestones 7-10 (CC11 expression,
+BLE, DIN UART, pitch bend) are not started.
 
 ## FreeRTOS architecture
 
@@ -75,6 +83,7 @@ exist yet.
 |---|---|---|---|---|
 | `audio_capture` | `audio_capture` component | 12 (highest) | 8192 B | ADC continuous-mode `on_conv_done` ISR notification |
 | `dsp_task` | `main.c` | 11 | 4096 B | `audio_capture_get_block()` (queue receive, 500 ms timeout) |
+| `midi_task` | `midi` component | 6 | 3072 B | `midi_event_t` queue receive (blocks indefinitely) |
 | `ui_task` | `main.c` | 5 | 3072 B | Fixed period, `YP_UI_REFRESH_RATE_HZ` (15 Hz default) |
 | `main_task` (IDF-owned) | ESP-IDF | default | default | runs `app_main()` once, then exits |
 
@@ -86,8 +95,26 @@ Rationale:
   notify - all actual work (raw-to-float conversion, DC removal, HPF,
   clip detection) happens in the task, per the project spec's "interrupts
   only move or signal data" rule.
-- **dsp_task is next** so RMS/envelope/VAD analysis is not delayed behind
-  UI work, but can still be preempted by fresh audio data.
+- **dsp_task is next** so RMS/envelope/VAD/pitch analysis is not delayed
+  behind UI or MIDI work, but can still be preempted by fresh audio data.
+  The note-stabilization state machine and `midi_send_*()` calls
+  (Milestone 5) run inline inside `dsp_task`, *not* as their own task,
+  despite the spec's architecture diagram showing a separate
+  "Voice-to-MIDI State Machine" stage: `yp_note_sm_process()` is a
+  handful of float comparisons per hop, not DSP, and `midi_send_*()`
+  only does a non-blocking queue send - handing that off to a whole
+  extra task/queue pair would add latency and complexity for zero
+  behavioral benefit, which is what the spec's own "do not create
+  unnecessary tasks" rule is for. The actual transport boundary - where
+  a slow/blocking operation could occur - is `midi_task` below, which
+  *is* its own task for exactly that reason.
+- **midi_task decouples MIDI transport from the DSP path**: dequeuing and
+  "transmitting" (today: logging; eventually: a BLE/UART write) happens
+  in its own task so a slow or blocked transport can never stall
+  `dsp_task`. Priority 6 sits above `ui_task` (a stuck transport
+  shouldn't queue up behind LCD drawing) but well below the audio/DSP
+  path (12/11) - MIDI output is not a hard real-time deadline the way
+  draining the ADC is.
 - **ui_task is low priority and rate-limited independently of the DSP
   loop**, per the project spec's "the DSP loop must never wait for the
   display" requirement. It communicates with dsp_task only through a
@@ -139,8 +166,8 @@ Matches the project spec's Section 22. Status as of this document:
 | 2 | RMS/envelope + voice activity detection | Done, verified on hardware |
 | 3 | Fundamental frequency detection (YIN) | Done, verified on hardware |
 | 4 | Frequency -> MIDI note conversion | Done, host-tested + verified on hardware |
-| 5 | MIDI Note On/Off generation | Not started |
-| 6 | Vocal dynamics -> MIDI velocity | Not started |
+| 5 | MIDI Note On/Off generation | Done, host-tested + verified on hardware |
+| 6 | Vocal dynamics -> MIDI velocity | Partially done (velocity mapping only - see docs/midi.md) |
 | 7 | Continuous CC11 Expression | Not started |
 | 8 | BLE MIDI | Not started |
 | 9 | DIN MIDI over UART (optional) | Not started |

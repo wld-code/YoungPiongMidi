@@ -1,8 +1,10 @@
 # MIDI
 
-**Status: not yet implemented (Milestones 5, 8, 9, 10).** This document
-describes the intended design, per the project spec, so the interface is
-settled before code lands on top of it.
+**Status: Milestone 5 implemented (note-stabilization state machine +
+Note On/Off event generation). Milestones 8, 9, 10 (real BLE/UART
+transports, pitch bend) not yet implemented** - see "Transports" below
+for exactly what that means today: events are generated and queued for
+real, but only reach a diagnostic log line, not a wire.
 
 ## Design
 
@@ -32,46 +34,102 @@ Audio Task -> DSP/Voice Analysis Task -> Voice-to-MIDI State Machine
     -> MIDI Task -> Transport (BLE, optionally UART DIN)
 ```
 
-`voice_midi` (the note-stabilization state machine + dynamics mapping)
-produces `midi_event_t`s and pushes them onto the queue; it never calls a
-transport function directly. `midi` owns the queue and dispatches to
+`voice_midi`'s note-stabilization state machine (`note_state_machine.c`)
+decides *when* a Note On/Off/Change should happen and computes the note
+number and velocity; `main.c`'s `dsp_task` takes that decision and calls
+`midi_send_note_on()`/`midi_send_note_off()` (in `components/midi`),
+which builds the `midi_event_t` and pushes it onto the queue.
+`voice_midi.c`/`note_state_machine.c` themselves never touch the queue,
+FreeRTOS, or ESP-IDF at all - see their own header comments - so they
+stay host-testable (`test/test_note_state_machine.c`). `midi.c` owns the
+queue and `midi_task`, which dequeues each event and dispatches it to
 whichever transport(s) are enabled (`YP_MIDI_BLE_ENABLED`,
-`YP_MIDI_UART_ENABLED` in `yp_config.h`).
+`YP_MIDI_UART_ENABLED` in `yp_config.h` - both 0 today).
 
 ## Transports
 
-- **BLE MIDI** (Milestone 8, default/primary): advertises as
-  `YP_BLE_DEVICE_NAME` ("YoungPiongMidi"). Own ESP-IDF component
-  (`midi_ble.c`), so NimBLE/Bluedroid specifics never leak into `midi.c`.
-- **DIN MIDI over UART** (Milestone 9, optional): standard 31250 baud
-  (`YP_MIDI_UART_BAUD`). Not wired to a GPIO yet - ESP-SensairShuttle's
-  documented pinout (see `docs/hardware.md`) does not reserve one, so
-  `YP_MIDI_UART_ENABLED` stays 0 until a pin is explicitly confirmed,
-  per the project spec's "do not assume a GPIO until it is explicitly
-  configured" rule.
+- **Right now**: neither BLE nor UART exists, so both flags above are 0
+  and `midi_task`'s only "transport" is a diagnostic `ESP_LOGI` line per
+  event (`midi.c`'s `log_event()`) - e.g. `NOTE_ON  ch=0 note=69 vel=84`.
+  This is not a stand-in to be embarrassed about: it is what makes Note
+  On/Off generation (Milestone 5) verifiable end to end on the console
+  *before* any wire protocol exists, exactly as the project spec's
+  incremental-milestones approach intends.
+- **BLE MIDI** (Milestone 8, default/primary, not yet implemented):
+  advertises as `YP_BLE_DEVICE_NAME` ("YoungPiongMidi"). Own ESP-IDF
+  component (`midi_ble.c`), so NimBLE/Bluedroid specifics never leak into
+  `midi.c`. `dispatch_event()` in `midi.c` has a `#if YP_MIDI_BLE_ENABLED`
+  guard already in place that intentionally fails the build (`#error`)
+  if the flag is ever set before `midi_ble.c` exists, rather than silently
+  compiling a no-op transport.
+- **DIN MIDI over UART** (Milestone 9, optional, not yet implemented):
+  standard 31250 baud (`YP_MIDI_UART_BAUD`). Not wired to a GPIO yet -
+  ESP-SensairShuttle's documented pinout (see `docs/hardware.md`) does
+  not reserve one, so `YP_MIDI_UART_ENABLED` stays 0 until a pin is
+  explicitly confirmed, per the project spec's "do not assume a GPIO
+  until it is explicitly configured" rule.
 - **USB MIDI**: deliberately not planned - ESP32-C5's USB-Serial/JTAG
   peripheral is not a generic USB-OTG MIDI device.
 
-## Note stabilization -> MIDI mapping (Milestone 5+)
+## Note stabilization -> MIDI mapping (Milestone 5, implemented)
 
-The note-stabilization state machine (SILENCE / ATTACK / NOTE_ACTIVE /
-NOTE_CHANGE / RELEASE, project spec section 7) is independent from the raw
-pitch detector: pitch naturally fluctuates frame to frame, and the state
-machine's job is to decide when that fluctuation should and should not
-become a MIDI event, using `YP_NOTE_MIN_STABLE_FRAMES`,
-`YP_NOTE_MIN_DURATION_MS`, `YP_NOTE_CHANGE_TOLERANCE_ST` and
-`YP_NOTE_RELEASE_FRAMES` from `yp_config.h`.
+The note-stabilization state machine (project spec section 7) is
+independent from the raw pitch detector: pitch naturally fluctuates frame
+to frame, and the state machine's job is to decide when that fluctuation
+should and should not become a MIDI event. Two states are actually
+persisted across hops in `yp_note_sm_t`, `SILENCE` and `NOTE_ACTIVE`;
+`ATTACK`, `NOTE_CHANGE` and `RELEASE` are represented as the
+`yp_note_event_t` returned on the one hop each transition happens (see
+`note_state_machine.c`'s header comment for the reasoning) rather than as
+separately-stored states with no behavioral difference.
 
-## Dynamics -> velocity / CC11 (Milestone 6-7)
+Mechanisms, each tied to the exact `yp_config.h` constant the spec asks
+for:
+- **Confidence threshold** (`YP_PITCH_CONFIDENCE_THRESHOLD`): a frame is
+  only considered at all if voice is active, confidence clears this bar,
+  and the frequency converts to a valid note.
+- **Minimum stable frames** (`YP_NOTE_MIN_STABLE_FRAMES`): a candidate
+  note (whether the very first one, or a proposed change) must repeat for
+  this many consecutive reliable frames before it is committed.
+- **Pitch hysteresis** (`YP_NOTE_CHANGE_TOLERANCE_ST`): compared against
+  the *fractional* MIDI note number, not the rounded integer (rounding
+  alone already groups anything within +/-0.5 semitones into one note,
+  so an integer comparison couldn't express a tolerance narrower or wider
+  than that) - this is what damps vibrato/jitter around a held pitch
+  without a single spurious event, which is directly asserted on in
+  `test_jitter_does_not_flicker`.
+- **Minimum note duration** (`YP_NOTE_MIN_DURATION_MS`): a note change is
+  withheld until the currently-held note has been active at least this
+  long, even if a stable new candidate has already appeared - prevents
+  rapid back-and-forth between two adjacent notes.
+- **Release frames** (`YP_NOTE_RELEASE_FRAMES`): Note Off is withheld
+  until pitch has been unreliable for this many *consecutive* frames, so
+  a single dropped/low-confidence frame mid-note doesn't cut it off.
 
-Velocity is derived from the envelope (`voice_analysis_t.level`) at note
-onset, using `YP_DEFAULT_VELOCITY_CURVE` (linear or logarithmic - log by
-default, since perceived loudness is closer to logarithmic than linear in
-RMS). Once a note is active, continued envelope changes are optionally
-streamed as CC11 Expression (`YP_CC11_ENABLED`), rate-limited by both a
-minimum value delta (`YP_CC11_MIN_DELTA`) and a minimum time interval
-(`YP_CC11_MIN_INTERVAL_MS`) so a continuously-varying voice does not flood
-the MIDI connection.
+248 host-test checks in `test/test_note_state_machine.c` exercise all of
+the above, including the exact spec wording this state machine exists to
+satisfy: "a small pitch fluctuation must not generate Note Off/On/Off/On
+continuously."
+
+## Dynamics -> velocity (Milestone 6, partially implemented) / CC11 (Milestone 7, not yet implemented)
+
+`yp_level_to_velocity()` (`voice_midi.c`) maps the envelope-followed
+level to a MIDI velocity using `YP_DEFAULT_VELOCITY_CURVE` (linear or
+logarithmic - log by default: it maps in the dB domain, so quiet-to-
+medium level changes get proportionally more of the velocity range,
+tracking perceived loudness better than a raw linear mapping). This
+exists now, ahead of Milestone 6 in the roadmap, because Milestone 5
+cannot emit a valid Note On without *some* velocity - see
+`components/voice_midi/include/voice_midi.h`'s comment on why. What
+Milestone 6 still adds: reconsidering whether attack-time velocity should
+differ from continued in-note dynamics tracking (right now the same
+function is used for both a note's initial velocity and, if a note
+changes, its new velocity - there is no separate mechanism yet for
+*continued* dynamics within one held note). CC11 Expression streaming
+while a note is held (`YP_CC11_ENABLED`, rate-limited by
+`YP_CC11_MIN_DELTA`/`YP_CC11_MIN_INTERVAL_MS`) is Milestone 7 and not
+started - `midi_send_cc()` exists in `components/midi/midi.h` (per the
+spec's transport-independent engine design) but nothing calls it yet.
 
 ## Pitch bend (Milestone 10, optional)
 
