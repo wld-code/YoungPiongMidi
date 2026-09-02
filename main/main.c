@@ -321,8 +321,14 @@ void app_main(void)
     /* Must come after self_test_run() (which fully tears down its own
      * temporary I2S_NUM_0 use) and before midi_init() (whose midi_task
      * will start dispatching events as soon as it's created) - see
-     * onboard_synth_init()'s doc comment. */
+     * onboard_synth_init()'s doc comment. Gated by YP_ONBOARD_SYNTH_ENABLED
+     * (yp_config.h) - 0 by default: PDM/I2S output is never configured
+     * at all in that case, not just muted, and MIDI generation/logging
+     * (and therefore the PC-side tools) are entirely unaffected either
+     * way - see the flag's own comment. */
+#if YP_ONBOARD_SYNTH_ENABLED
     ESP_ERROR_CHECK(onboard_synth_init());
+#endif
 
     ESP_ERROR_CHECK(audio_dsp_init());
     ESP_ERROR_CHECK(audio_capture_init());

@@ -189,9 +189,14 @@ the firmware is deciding, live - both driven by the exact same
 
 ### 🎛️ The board's own speaker
 
-Always on, no setup, nothing to run. `components/midi/onboard_synth.c`
-renders every event to a small fixed-point square/PWM voice (velocity →
-amplitude, CC11 → pulse width), ~12ms latency budget end to end.
+**Disabled by default** (`YP_ONBOARD_SYNTH_ENABLED` in `yp_config.h` -
+most people prefer one clean output, the PC-side Young Piong Synth
+Studio, over a second simpler one on the board). Flip that flag to 1 to
+get it back: `components/midi/onboard_synth.c` renders every event to a
+small fixed-point square/PWM voice (velocity → amplitude, CC11 → pulse
+width), ~12ms latency budget end to end. The boot self-test's own
+speaker melody is independently silenced by `YP_SELF_TEST_SPEAKER_ENABLED`
+(also 0 by default) for the same reason.
 
 > [!WARNING]
 > The mic and speaker sit close together on this board. Loud enough

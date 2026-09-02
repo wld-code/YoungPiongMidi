@@ -51,17 +51,14 @@ whichever transport(s) are enabled (`YP_MIDI_BLE_ENABLED`,
 ## Transports
 
 - **Right now**: neither BLE nor UART exists, so both flags above are 0.
-  `midi_task` still does two real things with every event, though: logs
-  it (`midi.c`'s `log_event()` - e.g. `NOTE_ON  ch=0 note=69 vel=84`) and
-  renders it to sound on the board's own speaker
-  (`components/midi/onboard_synth.c`, called from the same
-  `dispatch_event()`). Neither is a stand-in to be embarrassed about:
-  together they make Note On/Off/CC generation (Milestones 5-7)
-  verifiable end to end - on the console, and audibly, on the board
-  itself - *before* any wire protocol exists, exactly as the project
-  spec's incremental-milestones approach intends.
-- **onboard_synth** (not a spec milestone - a bring-up/verification
-  aid): a tiny monophonic square/PWM voice - fixed-point phase
+  `midi_task` always does one real thing with every event regardless:
+  logs it (`midi.c`'s `log_event()` - e.g. `NOTE_ON  ch=0 note=69
+  vel=84`) - this, not the board's own speaker, is what every PC-side
+  tool (`tools/acid_synth_monitor.py`, `tools/synth_studio.py`) actually
+  reads, and it is unconditional, unaffected by anything below.
+- **onboard_synth** (not a spec milestone - a bring-up/verification aid,
+  **disabled by default** - `YP_ONBOARD_SYNTH_ENABLED` in `yp_config.h`
+  is 0): a tiny monophonic square/PWM voice - fixed-point phase
   accumulator oscillator, Q15 linear amplitude envelope, CC11 Expression
   modulating pulse width (10%..90% duty) - played over the board's
   existing PDM speaker output (the same PA_CTL/PDM_P/PDM_N path as the
@@ -72,16 +69,26 @@ whichever transport(s) are enabled (`YP_MIDI_BLE_ENABLED`,
   64-bit floats and no CPU budget pressure (see that file's tuning
   comments) - reproducing it safely in fixed-point on a chip with no
   hardware FPU, debuggable only by flashing and listening, wasn't a risk
-  worth taking for what both tools are fundamentally for: hearing MIDI
-  output before Milestone 8/9 exist. Because the board's microphone and
-  speaker are physically close together, playing loud enough for the mic
-  to pick the output back up can create an audio feedback loop (the
-  synth's own note re-triggering a new detection) - not something
-  software here dampens; if it happens, it happens at real, audible
-  volume, not silently.
+  worth taking for what it and the Python tools are fundamentally for:
+  hearing MIDI output before Milestone 8/9 exist. Because the board's
+  microphone and speaker are physically close together, playing loud
+  enough for the mic to pick the output back up can create an audio
+  feedback loop (the synth's own note re-triggering a new detection) -
+  this, on top of most users preferring one clean output (the PC-side
+  Young Piong Synth Studio, with its 10 instruments and sequencer) over
+  a second, simpler one on the board itself, is why it now defaults off.
+  Flip `YP_ONBOARD_SYNTH_ENABLED` to 1 to get board-native sound back;
+  when 0, `onboard_synth_init()` is never called at all (in `main.c`) and
+  `onboard_synth_handle_event()` is never called either (in `midi.c`'s
+  `enqueue()`) - the PDM/I2S peripheral is never configured, not just
+  muted, so there's no PDM clock activity on GPIO1/7/8 either. The boot
+  self-test's own speaker melody (`main/self_test.c`) is independently
+  gated by `YP_SELF_TEST_SPEAKER_ENABLED` (also 0 by default) for the
+  same reason - the LCD half of that same self-test is silent and still
+  runs unconditionally.
 
-  Driven *synchronously* from `midi_send_*()` (in `midi.c`'s
-  `enqueue()`), not from `midi_task`'s queued dispatch the way
+  When enabled, driven *synchronously* from `midi_send_*()` (in
+  `midi.c`'s `enqueue()`), not from `midi_task`'s queued dispatch the way
   `log_event()` and future BLE/UART sends are - and its I2S DMA sizing is
   explicitly overridden to a ~12ms budget rather than the driver's
   ~90ms-implying default. Both were real, measured, user-reported

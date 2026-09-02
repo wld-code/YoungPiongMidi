@@ -245,6 +245,26 @@ typedef enum {
 
 #define YP_BLE_DEVICE_NAME             "YoungPiongMidi"
 
+/* The board's own speaker voice (components/midi/onboard_synth.c) -
+ * see that file's header comment for what it is. Set to 0 to keep the
+ * board silent and use only the PC-side output instead: tools/
+ * synth_studio.py (Young Piong Synth Studio, 10 instruments + a
+ * sequencer) or tools/acid_synth_monitor.py, both of which read the
+ * exact same MIDI event log this board always produces regardless of
+ * this flag - disabling onboard sound does not disable MIDI, only this
+ * one local playback path. When 0, onboard_synth_init() is never
+ * called: the PDM/I2S output is never configured at all (not just
+ * muted), so there is no PDM clock activity on GPIO1/7/8 either. */
+#define YP_ONBOARD_SYNTH_ENABLED       0
+
+/* The boot self-test's speaker melody (main/self_test.c) - a one-shot
+ * hardware check, unrelated to and independent of YP_ONBOARD_SYNTH_ENABLED
+ * above, but still real board audio output. Set to 0 along with it to
+ * keep the board fully silent at boot too; the LCD half of the same
+ * self-test (self_test.c's lcd_color_cycle()) is unaffected - it's
+ * silent already and still worth running. */
+#define YP_SELF_TEST_SPEAKER_ENABLED   0
+
 /* -------------------------------------------------------------------- */
 /*  Display                                                               */
 /* -------------------------------------------------------------------- */

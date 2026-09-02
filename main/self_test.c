@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include "self_test.h"
 #include "yp_board.h"
+#include "yp_config.h"
 #include "display.h"
 #include "driver/i2s_pdm.h"
 #include "esp_rom_gpio.h"
@@ -57,6 +58,8 @@ static void lcd_color_cycle(void)
 /* -------------------------------------------------------------------- */
 /*  Speaker melody                                                       */
 /* -------------------------------------------------------------------- */
+
+#if YP_SELF_TEST_SPEAKER_ENABLED
 
 #define MELODY_SAMPLE_RATE_HZ  16000
 #define MELODY_NOTE_MS         150
@@ -148,12 +151,19 @@ static void speaker_melody(void)
     i2s_del_channel(tx_handle);
 }
 
+#endif /* YP_SELF_TEST_SPEAKER_ENABLED */
+
 /* -------------------------------------------------------------------- */
 
 void self_test_run(void)
 {
     ESP_LOGI(TAG, "=== boot self-test start ===");
     lcd_color_cycle();
+#if YP_SELF_TEST_SPEAKER_ENABLED
     speaker_melody();
+#else
+    ESP_LOGI(TAG, "speaker self-test skipped (YP_SELF_TEST_SPEAKER_ENABLED=0 - "
+                  "board audio disabled, use the PC-side tools instead)");
+#endif
     ESP_LOGI(TAG, "=== boot self-test done ===");
 }

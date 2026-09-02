@@ -117,8 +117,18 @@ static esp_err_t enqueue(midi_event_type_t type, uint8_t channel, uint8_t data1,
      *   2. Safety: unlike a real transport, this can never legitimately
      *      block or fail in a way that should drop the event - it is
      *      not "queued", it just updates in place - so it does not need
-     *      the queue's overflow-drop protection either. */
+     *      the queue's overflow-drop protection either.
+     *
+     * Gated by YP_ONBOARD_SYNTH_ENABLED (yp_config.h, 0 by default) -
+     * onboard_synth_init() is never called either in that case (see
+     * main.c), so this would otherwise be calling into an uninitialized
+     * (if harmless - see onboard_synth.h) module for every single event;
+     * skipping the call entirely is clearer than relying on that. Queuing
+     * below (and therefore every other consumer - log_event(), future
+     * BLE/UART) is completely unaffected by this flag. */
+#if YP_ONBOARD_SYNTH_ENABLED
     onboard_synth_handle_event(&ev);
+#endif
 
     if (xQueueSend(s_queue, &ev, 0) != pdTRUE) {
         ESP_LOGW(TAG, "queue full, dropped a MIDI event (type=%d)", type);
