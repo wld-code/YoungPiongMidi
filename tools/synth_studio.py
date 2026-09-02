@@ -8,8 +8,11 @@ that exists), plays it through a 10-instrument polyphonic synth engine
 (synth_instruments.py), and shows the incoming audio waveform, MIDI
 event log, and a scrolling piano-roll of the melody the board generates
 - all live. Also includes a built-in 8-bank x 16-step sequencer
-(sequencer.py) and a WAV recorder (recorder.py) for programming and
-capturing your own patterns independent of the board.
+(sequencer.py), and each of those same 8 banks can additionally hold a
+live-recorded MIDI take (midi_recorder.py) - a real-time capture of
+whatever notes actually happened (from the board, the sequencer, or
+Demo mode), played back at its original timing and exportable as a
+standard .mid file.
 
 Quick start:
     pip install pyserial numpy sounddevice
@@ -22,19 +25,25 @@ Architecture (why threads are split this way):
     - serial-reader thread (midi_link.serial_reader_thread): parses the
       board's log, calls straight into SynthEngine.note_on/note_off/cc.
     - sequencer-player thread (sequencer.SequencerPlayer): steps through
-      the active bank at the configured tempo, also calling straight
-      into SynthEngine.note_on/note_off - from the engine's point of
-      view a sequencer step and a board note are indistinguishable, so
-      both show up in the same waveform/log/piano-roll for free.
-    - sounddevice audio callback thread: calls SynthEngine.render(),
+      the active bank's step pattern at the configured tempo, also
+      calling straight into SynthEngine.note_on/note_off - from the
+      engine's point of view a sequencer step and a board note are
+      indistinguishable, so both show up in the same waveform/log/
+      piano-roll for free, AND get captured by an active MIDI recording
+      with zero extra wiring (see below).
+    - take-player thread (midi_recorder.MidiTakePlayer): replays a
+      recorded take's notes at their original recorded timing.
+    - sounddevice audio callback thread: calls SynthEngine.render() and
       feeds a small lock-protected ring buffer the waveform view reads
-      from, and (while recording) hands the block to AudioRecorder -
-      kept separate from the Tk main thread since Tkinter is not
+      from - kept separate from the Tk main thread since Tkinter is not
       thread-safe and audio callbacks must never block on GUI work.
     - Tk main thread: runs the event loop and a periodic (~30 Hz) timer
       that pulls cheap snapshots (SynthEngine.snapshot_for_ui(), the
-      waveform ring buffer, SequencerPlayer.current_step) and redraws -
-      it never touches engine/voice/player internals directly.
+      waveform ring buffer, SequencerPlayer/MidiTakePlayer state) and
+      redraws - it never touches engine/voice/player internals directly.
+      MidiRecorder is fed from this same tick, ingesting the engine's
+      own event_log snapshot - see midi_recorder.py's own header comment
+      for why that means recording needs no per-source wiring at all.
 """
 import argparse
 import os
@@ -49,7 +58,7 @@ from midi_link import find_default_port, note_label, serial_reader_thread
 from synth_instruments import SynthEngine, INSTRUMENTS
 from sequencer import (SequencerModel, SequencerPlayer, step_duration_seconds,
                         NUM_BANKS, NUM_STEPS, MIN_BPM, MAX_BPM, DEFAULT_BPM)
-from recorder import AudioRecorder
+from midi_recorder import MidiRecorder, MidiTakePlayer, save_midi_file
 
 try:
     import tkinter as tk
@@ -147,9 +156,16 @@ class SynthStudioApp:
                                   # tick - a single int assignment, same reasoning as elsewhere
                                   # in this file for why that's safe without a lock
 
-        self.recorder = AudioRecorder(SAMPLE_RATE)
-        self.recording_started_at = None
-        self.last_recording_path = None
+        # One recorded MIDI take slot per bank (parallel to seq_model's
+        # one step-pattern per bank) - Record/Play/Save below all act on
+        # whichever bank is currently selected (self.seq_model.active_bank).
+        self.midi_recorder = MidiRecorder()
+        self.takes = [None] * NUM_BANKS      # MidiTake or None, per bank
+        self._recording_target_bank = None   # bank index locked in when Record starts,
+                                              # so switching banks mid-recording can't
+                                              # retarget where it gets saved on Stop
+        self.take_player = MidiTakePlayer(self.engine.note_on, self.engine.note_off)
+        self.last_saved_path = None
 
         self._build_ui()
         self._start_audio(device)
@@ -302,28 +318,53 @@ class SynthStudioApp:
         tk.Label(top_row, text="SEQUENCER", bg=PANEL_BG, fg=MUTED_FG,
                   font=("Helvetica", 9, "bold")).pack(side="left")
 
-        record_col = tk.Frame(top_row, bg=PANEL_BG)
-        record_col.pack(side="right")
-        self.seq_record_btn = tk.Button(record_col, text="● Record", command=self._toggle_recording,
-                                         bg="#3a1620", fg="#ffb3c0", relief="flat",
-                                         font=("Helvetica", 10, "bold"), padx=10, pady=4)
-        self.seq_record_btn.pack(side="right")
-        self.seq_play_btn = tk.Button(record_col, text="▶ Play", command=self._toggle_sequencer,
+        play_col = tk.Frame(top_row, bg=PANEL_BG)
+        play_col.pack(side="right")
+        self.seq_play_btn = tk.Button(play_col, text="▶ Play pattern", command=self._toggle_sequencer,
                                        bg=ACCENT, fg="#04121f", relief="flat",
                                        font=("Helvetica", 10, "bold"), padx=10, pady=4)
-        self.seq_play_btn.pack(side="right", padx=(0, 8))
-        self.record_status_var = tk.StringVar(value="")
-        tk.Label(top_row, textvariable=self.record_status_var, bg=PANEL_BG, fg=MUTED_FG,
-                  font=("Helvetica", 9)).pack(side="right", padx=(0, 12))
+        self.seq_play_btn.pack(side="right")
+
+        # --- MIDI take recording: Record / Play take / Save, all acting
+        # on whichever bank is currently selected (mirrors the step
+        # pattern - one recorded take slot per bank, same 8-bank
+        # selector below drives both). ---
+        rec_row = tk.Frame(seq_frame, bg=PANEL_BG)
+        rec_row.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(rec_row, text="MIDI RECORDING (per bank)", bg=PANEL_BG, fg=MUTED_FG,
+                  font=("Helvetica", 9, "bold")).pack(side="left")
+        self.take_save_btn = tk.Button(rec_row, text="💾 Save", command=self._on_save_take,
+                                        bg=PANEL_BG, fg=FG, relief="flat",
+                                        font=("Helvetica", 10, "bold"), padx=10, pady=4, state="disabled")
+        self.take_save_btn.pack(side="right")
+        self.take_play_btn = tk.Button(rec_row, text="▶ Play take", command=self._toggle_take_playback,
+                                        bg=PANEL_BG, fg=FG, relief="flat",
+                                        font=("Helvetica", 10, "bold"), padx=10, pady=4, state="disabled")
+        self.take_play_btn.pack(side="right", padx=8)
+        self.record_btn = tk.Button(rec_row, text="● Record", command=self._toggle_recording,
+                                     bg="#3a1620", fg="#ffb3c0", relief="flat",
+                                     font=("Helvetica", 10, "bold"), padx=10, pady=4)
+        self.record_btn.pack(side="right")
+        self.record_status_var = tk.StringVar(value="Bank 1: no take")
+        tk.Label(rec_row, textvariable=self.record_status_var, bg=PANEL_BG, fg=MUTED_FG,
+                  font=("Helvetica", 9)).pack(side="left", padx=(16, 0))
 
         # --- Tempo + note-to-place + clear ---
         tempo_row = tk.Frame(seq_frame, bg=PANEL_BG)
         tempo_row.pack(fill="x", padx=10, pady=(0, 6))
         tk.Label(tempo_row, text="Tempo", bg=PANEL_BG, fg=MUTED_FG, font=("Helvetica", 9)
                   ).pack(side="left")
+        # Deliberately NOT using Scale's own `command=` here - combined
+        # with a bound `variable`, it's a well-known unreliable pairing
+        # in Tkinter (the widget's internal Set doesn't consistently
+        # invoke -command through every interaction path, including its
+        # own .set() method - confirmed while testing this exact
+        # control). A variable trace fires on every real change
+        # regardless of how the value changed, so it's used instead.
         self.seq_bpm_var = tk.IntVar(value=DEFAULT_BPM)
+        self.seq_bpm_var.trace_add("write", self._on_bpm_var_changed)
         tk.Scale(tempo_row, from_=MIN_BPM, to=MAX_BPM, orient="horizontal", length=180,
-                 variable=self.seq_bpm_var, command=self._on_bpm_changed, bg=PANEL_BG, fg=FG,
+                 variable=self.seq_bpm_var, bg=PANEL_BG, fg=FG,
                  troughcolor="#0e1016", highlightthickness=0, relief="flat",
                  activebackground=ACCENT).pack(side="left", padx=(6, 4))
         self.seq_bpm_label_var = tk.StringVar(value=f"{DEFAULT_BPM} BPM")
@@ -378,6 +419,7 @@ class SynthStudioApp:
 
         self._redraw_seq_bank_buttons()
         self._redraw_seq_steps()
+        self._update_record_status_label()
 
     # --- Actions -----------------------------------------------------
     def select_instrument(self, inst_id):
@@ -444,10 +486,10 @@ class SynthStudioApp:
         # this app (WaveformBuffer, SynthEngine.snapshot_for_ui()).
         self._seq_playhead = step_index
 
-    def _on_bpm_changed(self, value):
+    def _on_bpm_var_changed(self, *_trace_args):
         try:
-            bpm = int(float(value))
-        except ValueError:
+            bpm = self.seq_bpm_var.get()
+        except tk.TclError:
             return
         self.seq_model.set_bpm(bpm)
         self.seq_bpm_label_var.set(f"{self.seq_model.bpm} BPM")
@@ -463,6 +505,7 @@ class SynthStudioApp:
         self.seq_model.select_bank(bank_index)
         self._redraw_seq_bank_buttons()
         self._redraw_seq_steps()
+        self._update_record_status_label()
 
     def _on_step_click(self, step_index):
         try:
@@ -502,26 +545,70 @@ class SynthStudioApp:
             btn.configure(text=text, bg=bg, fg=fg,
                           highlightbackground="#ffffff" if i == playhead else PANEL_BG)
 
-    # --- Recording -----------------------------------------------------
+    # --- MIDI take recording (Record / Play take / Save, per bank) ----
     def _toggle_recording(self):
-        if self.recorder.active:
-            audio = self.recorder.stop_and_get()
-            self.seq_record_btn.configure(text="● Record", bg="#3a1620", fg="#ffb3c0")
-            if len(audio) == 0:
-                self.record_status_var.set("nothing recorded (no audio was playing)")
+        if self.midi_recorder.active:
+            take = self.midi_recorder.stop()
+            self.record_btn.configure(text="● Record", bg="#3a1620", fg="#ffb3c0")
+            target_bank = self._recording_target_bank
+            self._recording_target_bank = None
+            if take.is_empty():
+                self._flash_record_status(f"Bank {target_bank + 1}: nothing recorded (no notes played)")
                 return
-            os.makedirs(RECORDINGS_DIR, exist_ok=True)
-            filename = f"seq_{time.strftime('%Y%m%d_%H%M%S')}.wav"
-            path = os.path.join(RECORDINGS_DIR, filename)
-            self.recorder.save_wav(audio, path)
-            self.last_recording_path = path
-            seconds = len(audio) / SAMPLE_RATE
-            self.record_status_var.set(f"saved {filename} ({seconds:.1f}s)")
+            self.takes[target_bank] = take
+            self._update_record_status_label()
         else:
-            self.recorder.start()
-            self.recording_started_at = time.time()
-            self.seq_record_btn.configure(text="■ Stop Rec", bg="#ff5f5f", fg="#04121f")
-            self.record_status_var.set("recording...")
+            # Lock in the target bank now, not at stop time - switching
+            # banks mid-recording (to watch a different pattern play,
+            # say) must not silently retarget where the take lands.
+            self._recording_target_bank = self.seq_model.active_bank
+            self.midi_recorder.start()
+            self.record_btn.configure(text="■ Stop Rec", bg="#ff5f5f", fg="#04121f")
+            self.record_status_var.set(f"Bank {self._recording_target_bank + 1}: recording...")
+
+    def _toggle_take_playback(self):
+        take = self.takes[self.seq_model.active_bank]
+        if self.take_player.playing:
+            self.take_player.stop()
+            self.take_play_btn.configure(text="▶ Play take", bg=PANEL_BG, fg=FG)
+        elif take is not None and not take.is_empty():
+            self.take_player.play(take)
+            self.take_play_btn.configure(text="■ Stop take", bg=ACCENT, fg="#04121f")
+
+    def _on_save_take(self):
+        bank = self.seq_model.active_bank
+        take = self.takes[bank]
+        if take is None or take.is_empty():
+            return
+        os.makedirs(RECORDINGS_DIR, exist_ok=True)
+        filename = f"take_bank{bank + 1}_{time.strftime('%Y%m%d_%H%M%S')}.mid"
+        path = os.path.join(RECORDINGS_DIR, filename)
+        save_midi_file(take, path)
+        self.last_saved_path = path
+        self._flash_record_status(f"Bank {bank + 1}: saved {filename}")
+
+    def _flash_record_status(self, text, hold_ms=2500):
+        """Shows `text` immediately, then reverts to the normal per-bank
+        take summary after hold_ms - used for one-shot confirmations
+        (saved/nothing-recorded) so they don't get silently overwritten
+        by the very next _tick() before anyone reads them, but also
+        don't sit there stale forever."""
+        self.record_status_var.set(text)
+        self.root.after(hold_ms, self._update_record_status_label)
+
+    def _update_record_status_label(self):
+        if self.midi_recorder.active:
+            return  # _tick() is already showing live elapsed time for this
+        bank = self.seq_model.active_bank
+        take = self.takes[bank]
+        if take is None or take.is_empty():
+            self.record_status_var.set(f"Bank {bank + 1}: no take")
+        else:
+            self.record_status_var.set(
+                f"Bank {bank + 1}: {take.duration:.1f}s take, {take.note_on_count()} notes")
+        can_act = take is not None and not take.is_empty()
+        self.take_play_btn.configure(state="normal" if can_act else "disabled")
+        self.take_save_btn.configure(state="normal" if can_act else "disabled")
 
     def reconnect(self):
         port = find_default_port()
@@ -608,7 +695,6 @@ class SynthStudioApp:
                 pass  # underruns can happen while the UI thread is busy; audible, not fatal
             block = self.engine.render(frames)
             self.waveform.write(block)
-            self.recorder.write(block)  # no-op when not recording (checked inside)
             outdata[:, 0] = block
 
         try:
@@ -628,6 +714,7 @@ class SynthStudioApp:
         self._tick_count += 1
         snap = self.engine.snapshot_for_ui()
         self.note_history.ingest(snap["events"])
+        self.midi_recorder.ingest(snap["events"])
         self._draw_waveform()
         self._draw_meter()
         self._draw_piano_roll()
@@ -641,9 +728,16 @@ class SynthStudioApp:
             self.held_var.set("Held: " + ", ".join(parts))
         else:
             self.held_var.set("Held: -")
-        if self.recorder.active and self.recording_started_at is not None:
-            elapsed = time.time() - self.recording_started_at
-            self.record_status_var.set(f"recording... {elapsed:0.1f}s")
+        if self.midi_recorder.active:
+            self.record_status_var.set(
+                f"Bank {self._recording_target_bank + 1}: recording... {self.midi_recorder.elapsed():0.1f}s")
+        # The take player can finish on its own (reaching the end of the
+        # take) without any button click, so its button state is synced
+        # here every tick rather than only from _toggle_take_playback().
+        if self.take_player.playing:
+            self.take_play_btn.configure(text="■ Stop take", bg=ACCENT, fg="#04121f")
+        else:
+            self.take_play_btn.configure(text="▶ Play take", bg=PANEL_BG, fg=FG)
         if not self.stop_event.is_set():
             self.root.after(int(1000 / UI_FPS), self._tick)
 
@@ -749,40 +843,60 @@ class SynthStudioApp:
         self.log_text.configure(state="disabled")
 
     def _run_smoke_test_sequence(self):
-        """Exercises the sequencer + recorder end to end, not just the
-        demo riff - programs a small pattern on bank 2, selects it,
-        starts playback, and starts recording, all through the exact
+        """Exercises the sequencer + MIDI take recorder end to end, not
+        just the demo riff - programs a small pattern on bank 2, selects
+        it, starts pattern playback (which also feeds the recorder,
+        since it captures whatever the engine actually plays,
+        regardless of source), and arms Record - all through the exact
         same methods the GUI's own buttons call. Verified in
-        _smoke_test_finish() below."""
+        _smoke_test_finish() below, after letting it run for a bit."""
         self.select_instrument(0)
         self._on_bank_select(1)  # bank 2 (0-indexed)
         for step_index, note in ((0, 48), (4, 55), (8, 60), (12, 63)):
             self.seq_model.toggle_step(1, step_index, note)
         self.seq_model.toggle_accent(1, 8)
-        self._on_bpm_changed(180)
-        self._toggle_sequencer()   # start playback
-        self._toggle_recording()   # start recording
+        self.seq_bpm_var.set(180)
+        self._toggle_sequencer()   # start pattern playback
+        self._toggle_recording()   # arm MIDI take recording (bank 2)
 
     def _smoke_test_finish(self):
         seq_was_playing = self.seq_player.playing
-        if self.recorder.active:
-            self._toggle_recording()  # stop + save, exactly like a user clicking the button
+        if self.midi_recorder.active:
+            self._toggle_recording()  # stop + store, exactly like a user clicking the button
         self.seq_player.stop(join=True)
-        recording_ok = (self.last_recording_path is not None
-                         and os.path.exists(self.last_recording_path)
-                         and os.path.getsize(self.last_recording_path) > 44)  # > just the WAV header
+
+        take = self.takes[1]  # bank 2, 0-indexed
+        take_ok = take is not None and not take.is_empty()
+        saved_path = None
+        if take_ok:
+            self._on_save_take()
+            saved_path = self.last_saved_path
+        save_ok = saved_path is not None and os.path.exists(saved_path) and os.path.getsize(saved_path) > 20
+
+        # Also exercise take playback itself, not just capture+save.
+        take_playback_ran = False
+        if take_ok:
+            self._toggle_take_playback()
+            take_playback_ran = self.take_player.playing
+            self.take_player.stop(join=True)
+
+        take_summary = (f"take_captured=True ({take.note_on_count()} notes, {take.duration:.1f}s)"
+                         if take_ok else "take_captured=False")
         print(f"[smoke-test] {self._tick_count} UI redraw ticks completed without exception, "
               f"active_voices last seen={self.engine.snapshot_for_ui()['active_voices']}, "
               f"connection_status={self.connection_status!r}, "
               f"events_logged={len(self.engine.event_log)}, "
               f"sequencer_was_playing={seq_was_playing}, "
-              f"recording_saved={recording_ok} ({self.last_recording_path})")
+              f"{take_summary}, "
+              f"take_played_back={take_playback_ran}, "
+              f"take_saved={save_ok} ({saved_path})")
         self._on_close()
 
     def _on_close(self):
         self.stop_event.set()
         self.demo_running = False
         self.seq_player.stop()
+        self.take_player.stop()
         if getattr(self, "stream", None) is not None:
             try:
                 self.stream.stop()

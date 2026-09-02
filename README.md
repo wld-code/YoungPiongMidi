@@ -132,7 +132,7 @@ tools/              acid_synth_monitor.py - real-time audio monitor
                                              instrument GUI synth + sequencer
                                              + live waveform/MIDI/melody view
                     sequencer.py          - 8-bank x 16-step sequencer model
-                    recorder.py           - WAV recorder
+                    midi_recorder.py      - live MIDI take recorder + .mid export
                     midi_link.py          - shared serial-MIDI-log parsing
 ```
 
@@ -261,13 +261,23 @@ python3 tools/synth_studio.py
 - **An 8-bank x 16-step sequencer** (`tools/sequencer.py`): left-click a
   step to place the currently-selected note, right-click to accent it,
   pick which of the 8 banks is active, drag the tempo slider (40-240
-  BPM), and hit **Play**/**Stop**. Switching banks mid-playback takes
-  effect on the next step boundary, like a real hardware sequencer.
-  Sequencer notes go through the exact same engine call as a note from
-  the board, so they show up in the waveform/log/piano-roll for free.
-- **Record** captures whatever's actually coming out of the synth engine
-  (sequencer, board, or Demo mode - whatever's playing) to a WAV file
-  under `tools/recordings/` (gitignored), named by timestamp.
+  BPM), and hit **Play pattern**/**Stop**. Switching banks mid-playback
+  takes effect on the next step boundary, like a real hardware
+  sequencer. Sequencer notes go through the exact same engine call as a
+  note from the board, so they show up in the waveform/log/piano-roll
+  for free.
+- **Live MIDI recording, one take per bank** (`tools/midi_recorder.py`):
+  **Record** arms real-time capture of whatever notes actually happen
+  next - from the board (singing/playing), the step sequencer, Demo
+  mode, or the Test Note button, all of it, unquantized, at their real
+  timing - into whichever bank is currently selected; **Play take**
+  replays that bank's captured performance at its original timing; **💾
+  Save** exports it as a standard `.mid` file under `tools/recordings/`
+  (gitignored) - a real, DAW-importable MIDI recording, not audio. This
+  is a genuinely different thing from the step sequencer above (a fixed
+  16-step grid you program by hand) - it's a live take of an actual
+  performance, the same idea as pressing Record on a hardware sequencer/
+  DAW and then singing.
 - **Live waveform**, a VU-style level meter, and a scrolling piano-roll
   of the actual melody being generated - not a mockup, driven by the
   same NOTE_ON/NOTE_OFF/CC log line the onboard synth and
@@ -296,15 +306,28 @@ python3 tools/synth_studio.py
 >   switching mid-playback, and a real threading race caught and fixed
 >   (a fast Stop-then-Play could silently no-op, or - worse - leave an
 >   orphaned background thread still firing notes after a restart).
-> - **Recorder correctness** (`python3 tools/test_recorder.py`,
->   headless): capture/concatenation, start/stop resets, and that the
->   saved WAV is valid (right sample rate/format, actually contains the
->   audio, clips rather than wraps out-of-range samples).
+> - **MIDI recorder correctness** (`python3 tools/test_midi_recorder.py`,
+>   headless): capture timing/ordering/dedup, playback firing the right
+>   notes at the right times with no stuck notes on an early stop, the
+>   exact same restart race as the sequencer's (found and fixed the same
+>   way), and the `.mid` file writer verified by round-tripping its
+>   actual output bytes through a small standalone parser written into
+>   the test itself - not just checking the encoder's own internal
+>   consistency.
+> - **Interactive verification**: every control in this section (tempo
+>   slider, bank buttons, step grid, Record/Play take/Save) was driven
+>   programmatically end to end (`.invoke()` on buttons, the same
+>   variable-write path a real slider drag takes) and checked against
+>   real state changes - this is how a **real bug in the tempo slider**
+>   was caught and fixed: `Scale(variable=..., command=...)` doesn't
+>   reliably fire `command` in Tkinter even from the widget's own
+>   `.set()`, a known pitfall; replaced with a variable trace, which does.
 > - **End-to-end integration**: `synth_studio.py --smoke-test N` opens
 >   the real window, connects to the real board over serial, programs a
->   sequencer pattern, plays it, records it, and verifies a non-empty,
->   non-silent WAV came out the other end - all through the exact same
->   code path the UI buttons call.
+>   sequencer pattern, plays it, records a take from it, plays the take
+>   back, and saves it - verifying a real, valid, correctly-timed `.mid`
+>   file came out the other end - all through the exact same code path
+>   the UI buttons call.
 
 ## 📖 How to use it
 

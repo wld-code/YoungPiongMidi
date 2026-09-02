@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""
+midi_recorder.py - real-time MIDI performance recorder for Young Piong
+Synth Studio (tools/synth_studio.py). Captures incoming note_on/
+note_off events with their actual real-time timing while armed - a
+genuine MIDI recording (a "take"), not audio - then can play it back
+through the exact recorded timing and save it as a standard MIDI file
+(.mid) that any DAW can open.
+
+Deliberately separate from sequencer.py: the step sequencer edits a
+fixed 16-step/8-bank quantized pattern; this instead records an
+arbitrary-length, arbitrarily-timed performance - the same idea as
+hitting Record on a hardware sequencer/DAW and then singing or playing,
+capturing exactly what happened and when, unquantized.
+
+MidiRecorder is deliberately NOT threaded or lock-protected, unlike
+SequencerPlayer/the rest of this app's cross-thread state: it is always
+driven from the Tk main thread's own ~30Hz redraw tick, fed the same
+already-ordered `SynthEngine.event_log` snapshot the piano-roll and MIDI
+log already read (see synth_studio.py's _tick()) - there is no
+producer/consumer split here to guard, and reusing that single source of
+truth means a recording captures a note regardless of where it came from
+(the board, the sequencer, Demo mode, the Test Note button) with zero
+extra wiring at each call site.
+"""
+import threading
+import time
+
+
+class MidiTake:
+    """An immutable recorded performance: a time-ordered list of
+    (t_seconds, kind, note, velocity) tuples, t=0 at the moment
+    recording started. `kind` is "note_on" or "note_off"."""
+
+    def __init__(self, events):
+        self.events = events
+
+    @property
+    def duration(self) -> float:
+        return self.events[-1][0] if self.events else 0.0
+
+    def is_empty(self) -> bool:
+        return len(self.events) == 0
+
+    def note_on_count(self) -> int:
+        return sum(1 for e in self.events if e[1] == "note_on")
+
+
+class MidiRecorder:
+    def __init__(self):
+        self.active = False
+        self._events = []
+        self._start_time = None
+        self._last_seen_ts = 0.0
+
+    def start(self):
+        self._events = []
+        self._start_time = time.time()
+        self._last_seen_ts = self._start_time
+        self.active = True
+
+    def ingest(self, events):
+        """`events`: SynthEngine.event_log-shaped dicts, chronological -
+        each at least {"t": wall_clock_seconds, "kind": "note_on"/
+        "note_off"/"cc", "note": ..., "velocity": ... (note_on only)}.
+        Safe to call repeatedly with an overlapping/growing log (only
+        events strictly newer than the last-ingested one are kept) and
+        safe to call while inactive (a no-op) - callers don't need to
+        track their own cursor separately from what NoteHistory/the log
+        view already track."""
+        if not self.active:
+            return
+        for e in events:
+            if e["t"] <= self._last_seen_ts:
+                continue
+            self._last_seen_ts = e["t"]
+            if e["kind"] not in ("note_on", "note_off"):
+                continue
+            rel_t = e["t"] - self._start_time
+            if rel_t < 0:
+                continue  # an event timestamped before start() (shouldn't happen; defensive)
+            velocity = e.get("velocity", 0)
+            self._events.append((rel_t, e["kind"], e["note"], velocity))
+
+    def elapsed(self) -> float:
+        if not self.active or self._start_time is None:
+            return 0.0
+        return time.time() - self._start_time
+
+    def stop(self) -> MidiTake:
+        self.active = False
+        take = MidiTake(list(self._events))
+        self._events = []
+        return take
+
+
+class MidiTakePlayer:
+    """Plays a MidiTake back through note_on(note, velocity)/note_off
+    (note) callables at its original recorded timing (unquantized,
+    unlike sequencer.SequencerPlayer) - same background-thread-per-run
+    pattern as SequencerPlayer, including the same fix for the same
+    class of restart race (see sequencer.py's SequencerPlayer.start()
+    comment): each play() gives its run its own fresh stop Event and
+    joins any still-alive previous thread first, and stop() flips
+    `.playing` synchronously rather than leaving it to the thread's own
+    (necessarily asynchronous) cleanup.
+    """
+
+    def __init__(self, note_on, note_off, on_finished=None):
+        self.note_on = note_on
+        self.note_off = note_off
+        self.on_finished = on_finished  # optional callable(), invoked from the player's
+                                         # OWN thread when playback ends - callers on Tk
+                                         # must not touch widgets in it directly (same rule
+                                         # as SequencerPlayer's on_step)
+        self._thread = None
+        self._stop_event = threading.Event()
+        self.playing = False
+        self.position = 0.0
+
+    def play(self, take: MidiTake):
+        if take.is_empty():
+            return
+        if self._thread is not None and self._thread.is_alive():
+            self._stop_event.set()
+            self._thread.join(timeout=2.0)
+
+        self.playing = True
+        self.position = 0.0
+        stop_event = threading.Event()
+        self._stop_event = stop_event
+        self._thread = threading.Thread(target=self._run, args=(take, stop_event), daemon=True)
+        self._thread.start()
+
+    def stop(self, join=False):
+        self._stop_event.set()
+        self.playing = False
+        if join and self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _run(self, take: MidiTake, stop_event: threading.Event):
+        held_notes = set()
+        try:
+            t_prev = 0.0
+            for (t, kind, note, velocity) in take.events:
+                wait = t - t_prev
+                if wait > 0 and stop_event.wait(wait):
+                    break
+                t_prev = t
+                self.position = t
+                if kind == "note_on":
+                    self.note_on(note, velocity)
+                    held_notes.add(note)
+                elif kind == "note_off":
+                    self.note_off(note)
+                    held_notes.discard(note)
+        finally:
+            for n in held_notes:
+                self.note_off(n)
+            self.playing = False
+            self.position = 0.0
+            if self.on_finished:
+                self.on_finished()
+
+
+# --- Standard MIDI File (format 0) writer, no external dependencies ----
+
+def _vlq(value: int) -> bytes:
+    """Encodes a non-negative int as a MIDI variable-length quantity."""
+    buf = [value & 0x7F]
+    value >>= 7
+    while value:
+        buf.insert(0, (value & 0x7F) | 0x80)
+        value >>= 7
+    return bytes(buf)
+
+
+def save_midi_file(take: MidiTake, path: str, ppqn: int = 480, bpm: float = 120.0):
+    """Writes `take` as a standard format-0 .mid file with one track.
+
+    The recording has no inherent tempo (it's a real-time capture, not
+    a quantized pattern), so rather than guessing one, this fixes a
+    tempo/PPQN pair purely to define a tick resolution fine enough to
+    preserve the original timing: ticks_per_second = ppqn * bpm / 60 -
+    the defaults (480 PPQN @ 120 BPM = 960 ticks/sec, ~1.04ms per tick)
+    comfortably beat this app's own ~30Hz event-ingestion rate, so no
+    audible timing is lost to quantization. Any DAW opening the file
+    will show it at 120 BPM, but the actual note-to-note timing played
+    back is the real, recorded timing regardless of that displayed
+    tempo - a MIDI file's absolute event times are ticks, not "beats
+    that happen to look like 120 BPM had significance."
+    """
+    ticks_per_second = ppqn * bpm / 60.0
+    track = bytearray()
+
+    us_per_quarter = int(round(60_000_000 / bpm))
+    track += _vlq(0) + bytes([0xFF, 0x51, 0x03]) + us_per_quarter.to_bytes(3, "big")
+
+    last_tick = 0
+    for (t, kind, note, velocity) in take.events:
+        tick = round(t * ticks_per_second)
+        delta = max(0, tick - last_tick)
+        last_tick = tick
+        status = 0x90 if kind == "note_on" else 0x80
+        note = max(0, min(127, int(note)))
+        vel = max(0, min(127, int(velocity))) if kind == "note_on" else 0
+        track += _vlq(delta) + bytes([status, note, vel])
+
+    track += _vlq(0) + bytes([0xFF, 0x2F, 0x00])  # End of Track (required)
+
+    header = (b"MThd" + (6).to_bytes(4, "big") + (0).to_bytes(2, "big")
+              + (1).to_bytes(2, "big") + ppqn.to_bytes(2, "big"))
+    track_chunk = b"MTrk" + len(track).to_bytes(4, "big") + bytes(track)
+
+    with open(path, "wb") as f:
+        f.write(header + track_chunk)
