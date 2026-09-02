@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 
-from midi_recorder import MidiRecorder, MidiTake, MidiTakePlayer, save_midi_file, _vlq
+from midi_recorder import MidiRecorder, MidiTake, MidiTakePlayer, LiveRecordSession, save_midi_file, _vlq
 
 failures = []
 
@@ -171,6 +171,104 @@ def test_player_restart_while_previous_still_alive_leaves_no_orphan():
     player.stop(join=True)
 
 
+def test_player_loop_true_repeats_until_stopped():
+    take = MidiTake([(0.0, "note_on", 60, 100), (0.01, "note_off", 60, 0)])
+    events = []
+    player = MidiTakePlayer(lambda n, v: events.append(("on", n)), lambda n: events.append(("off", n)))
+    player.play(take, loop=True)
+    time.sleep(0.06)  # enough real time for several ~0.01s loops to have happened
+    still_playing = player.playing
+    player.stop(join=True)
+
+    note_on_count = sum(1 for e in events if e[0] == "on")
+    check("loop=True keeps the player running past a single pass", still_playing)
+    check("loop=True fires the take's note_on more than once", note_on_count > 1,
+          f"got {note_on_count} note_on events")
+    check("stop() ends the loop (playing False afterward)", not player.playing)
+
+
+def test_player_loop_false_default_still_plays_once_and_stops():
+    take = MidiTake([(0.0, "note_on", 60, 100), (0.01, "note_off", 60, 0)])
+    events = []
+    finished = {"called": False}
+    player = MidiTakePlayer(lambda n, v: events.append(("on", n)), lambda n: events.append(("off", n)),
+                             on_finished=lambda: finished.__setitem__("called", True))
+    player.play(take)  # loop defaults to False
+    player._thread.join(timeout=2.0)
+    check("default (loop=False) plays exactly one pass", sum(1 for e in events if e[0] == "on") == 1)
+    check("default (loop=False) calls on_finished and stops on its own", finished["called"] and not player.playing)
+
+
+# --- LiveRecordSession -----------------------------------------------------
+
+def test_live_session_arm_records_into_current_bank():
+    session = LiveRecordSession()
+    check("starts unarmed on bank 0 (bank 1)", not session.armed and session.current_bank == 0)
+    session.arm()
+    check("armed after arm()", session.armed)
+    t0 = session._recorder._start_time
+    session.ingest([{"t": t0 + 0.05, "kind": "note_on", "note": 60, "velocity": 100}])
+    result = session.disarm()
+    check("disarm() returns the finalized (bank, take) when something was recorded",
+          result is not None and result[0] == 0, f"got {result}")
+    check("the returned take actually has the note", result[1].note_on_count() == 1)
+    check("disarmed after disarm()", not session.armed)
+
+
+def test_live_session_bank_switch_while_armed_retargets_and_finalizes():
+    session = LiveRecordSession()
+    session.arm()
+    t0 = session._recorder._start_time
+    session.ingest([{"t": t0 + 0.05, "kind": "note_on", "note": 48, "velocity": 100}])
+
+    result = session.set_active_bank(2)
+    check("switching banks while armed finalizes the bank being left (bank 0)",
+          result is not None and result[0] == 0 and result[1].note_on_count() == 1, f"got {result}")
+    check("current_bank updates to the new bank", session.current_bank == 2)
+    check("still armed after a bank switch - recording keeps going, just retargeted", session.armed)
+
+    t1 = session._recorder._start_time
+    session.ingest([{"t": t1 + 0.05, "kind": "note_on", "note": 55, "velocity": 90}])
+    result2 = session.disarm()
+    check("the segment captured after switching belongs to the new bank",
+          result2 is not None and result2[0] == 2 and result2[1].note_on_count() == 1, f"got {result2}")
+
+
+def test_live_session_switching_to_a_bank_with_no_new_notes_reports_nothing():
+    """The core safety property: switching banks (or arming) without
+    actually playing anything must never look like "a take was
+    recorded" to the caller - the caller only overwrites
+    self.takes[bank] when it gets a non-None result back."""
+    session = LiveRecordSession()
+    session.arm()
+    # No ingest() calls at all - nothing was ever played on bank 0.
+    result = session.set_active_bank(3)
+    check("switching banks having recorded nothing returns None, not an empty take",
+          result is None)
+    check("still armed, now targeting the new bank", session.armed and session.current_bank == 3)
+
+    result2 = session.disarm()
+    check("disarming having (still) recorded nothing also returns None", result2 is None)
+
+
+def test_live_session_set_active_bank_to_same_bank_is_a_no_op():
+    session = LiveRecordSession()
+    session.arm()
+    t0 = session._recorder._start_time
+    session.ingest([{"t": t0 + 0.02, "kind": "note_on", "note": 60, "velocity": 100}])
+    result = session.set_active_bank(0)  # already on bank 0
+    check("selecting the already-active bank does not finalize/reset anything",
+          result is None)
+    check("the in-progress capture is untouched (still has its event)",
+          len(session._recorder._events) == 1)
+
+
+def test_live_session_default_bank_is_zero():
+    session = LiveRecordSession()
+    check("a fresh session defaults to bank 0 (bank 1), matching the app's default selection",
+          session.current_bank == 0)
+
+
 # --- Standard MIDI File writer --------------------------------------------
 
 def _decode_vlq(data: bytes, pos: int):
@@ -306,6 +404,14 @@ def main():
     test_player_stop_mid_playback_releases_held_notes()
     test_player_empty_take_is_a_no_op()
     test_player_restart_while_previous_still_alive_leaves_no_orphan()
+    test_player_loop_true_repeats_until_stopped()
+    test_player_loop_false_default_still_plays_once_and_stops()
+
+    test_live_session_arm_records_into_current_bank()
+    test_live_session_bank_switch_while_armed_retargets_and_finalizes()
+    test_live_session_switching_to_a_bank_with_no_new_notes_reports_nothing()
+    test_live_session_set_active_bank_to_same_bank_is_a_no_op()
+    test_live_session_default_bank_is_zero()
 
     test_vlq_round_trips()
     test_save_midi_file_header_and_tempo()

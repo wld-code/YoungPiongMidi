@@ -266,18 +266,25 @@ python3 tools/synth_studio.py
   sequencer. Sequencer notes go through the exact same engine call as a
   note from the board, so they show up in the waveform/log/piano-roll
   for free.
-- **Live MIDI recording, one take per bank** (`tools/midi_recorder.py`):
-  **Record** arms real-time capture of whatever notes actually happen
-  next - from the board (singing/playing), the step sequencer, Demo
-  mode, or the Test Note button, all of it, unquantized, at their real
-  timing - into whichever bank is currently selected; **Play take**
-  replays that bank's captured performance at its original timing; **💾
-  Save** exports it as a standard `.mid` file under `tools/recordings/`
-  (gitignored) - a real, DAW-importable MIDI recording, not audio. This
-  is a genuinely different thing from the step sequencer above (a fixed
-  16-step grid you program by hand) - it's a live take of an actual
-  performance, the same idea as pressing Record on a hardware sequencer/
-  DAW and then singing.
+- **Live MIDI recording, a looper with one take per bank**
+  (`tools/midi_recorder.py`): **Record** arms real-time capture of
+  whatever notes actually happen next - from the board (singing/
+  playing), the step sequencer, Demo mode, or the Test Note button, all
+  of it, unquantized, at their real timing. Recording always follows
+  whichever bank is currently selected (default: bank 1) - switching
+  banks *while armed* finalizes what you just captured and immediately
+  starts capturing into the new bank instead, no need to stop and
+  restart Record for each one. A bank's existing take is only ever
+  replaced once a switch (or Stop) finalizes a segment that actually
+  captured a note - just landing on, or re-arming over, a bank that
+  already has one never erases it. **Play take** loops that bank's
+  captured performance at its original timing, repeating automatically
+  until Stop; **💾 Save** exports it as a standard `.mid` file under
+  `tools/recordings/` (gitignored) - a real, DAW-importable MIDI
+  recording, not audio. This is a genuinely different thing from the
+  step sequencer above (a fixed 16-step grid you program by hand) -
+  it's a live take of an actual performance, the same idea as a
+  hardware loop pedal or a DAW's Session View.
 - **Live waveform**, a VU-style level meter, and a scrolling piano-roll
   of the actual melody being generated - not a mockup, driven by the
   same NOTE_ON/NOTE_OFF/CC log line the onboard synth and
@@ -307,13 +314,17 @@ python3 tools/synth_studio.py
 >   (a fast Stop-then-Play could silently no-op, or - worse - leave an
 >   orphaned background thread still firing notes after a restart).
 > - **MIDI recorder correctness** (`python3 tools/test_midi_recorder.py`,
->   headless): capture timing/ordering/dedup, playback firing the right
->   notes at the right times with no stuck notes on an early stop, the
->   exact same restart race as the sequencer's (found and fixed the same
->   way), and the `.mid` file writer verified by round-tripping its
->   actual output bytes through a small standalone parser written into
->   the test itself - not just checking the encoder's own internal
->   consistency.
+>   69 headless checks): capture timing/ordering/dedup, playback firing
+>   the right notes at the right times with no stuck notes on an early
+>   stop, looped playback genuinely repeating rather than stopping after
+>   one pass, the exact same restart race as the sequencer's (found and
+>   fixed the same way), the bank-following live-looper logic
+>   (`LiveRecordSession`) - switching banks while armed finalizes and
+>   retargets correctly, and switching to/re-arming on a bank with no
+>   new notes never fabricates or erases a take - and the `.mid` file
+>   writer verified by round-tripping its actual output bytes through a
+>   small standalone parser written into the test itself, not just
+>   checking the encoder's own internal consistency.
 > - **Interactive verification**: every control in this section (tempo
 >   slider, bank buttons, step grid, Record/Play take/Save) was driven
 >   programmatically end to end (`.invoke()` on buttons, the same

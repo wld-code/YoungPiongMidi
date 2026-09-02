@@ -94,6 +94,76 @@ class MidiRecorder:
         return take
 
 
+class LiveRecordSession:
+    """Orchestrates a MidiRecorder across bank switches for a live-
+    looper-style recording workflow: while armed, notes are always
+    captured into whichever bank is *currently selected* - selecting a
+    different bank while armed finalizes whatever was just captured for
+    the bank you were on and immediately begins a fresh capture for the
+    newly selected bank, so recording never has to be stopped and
+    restarted by hand just to move to another bank.
+
+    The one rule that makes this safe rather than destructive: a bank's
+    existing take is only ever replaced by finalizing a segment that
+    actually captured at least one note. Switching to (or re-arming on)
+    a bank that already holds a take, then switching away again without
+    having played anything, leaves that take completely untouched -
+    "il ne supprime pas sauf si je joue un son." The caller (synth_studio.py)
+    is the one that actually writes into `self.takes[bank]`; this class
+    only ever *offers* a finalized (bank, MidiTake) pair when there's
+    something genuinely new to store, and returns None otherwise -
+    deciding "clear vs. keep" by never handing back an empty result.
+
+    Deliberately holds no reference to SequencerModel/NUM_BANKS - the
+    caller is the single source of truth for which bank is selected
+    (via set_active_bank()); this class only needs to know when that
+    changes.
+    """
+
+    def __init__(self):
+        self.armed = False
+        self.current_bank = 0
+        self._recorder = MidiRecorder()
+
+    def set_active_bank(self, bank_index: int):
+        """Call whenever the (single, shared) bank selector changes,
+        armed or not. Returns (old_bank_index, MidiTake) if something
+        was actually captured for the bank being left, else None."""
+        if bank_index == self.current_bank:
+            return None
+        finished = None
+        if self.armed:
+            finished = self._finalize_if_nonempty()
+            self._recorder.start()  # keep capturing, now for the new bank
+        self.current_bank = bank_index
+        return finished
+
+    def arm(self):
+        self.armed = True
+        self._recorder.start()
+
+    def disarm(self):
+        """Stops capturing. Returns (bank_index, MidiTake) if something
+        was actually recorded this segment, else None - in which case
+        the caller must NOT touch that bank's existing take."""
+        if not self.armed:
+            return None
+        self.armed = False
+        return self._finalize_if_nonempty()
+
+    def _finalize_if_nonempty(self):
+        take = self._recorder.stop()
+        if take.is_empty():
+            return None
+        return (self.current_bank, take)
+
+    def ingest(self, events):
+        self._recorder.ingest(events)
+
+    def elapsed(self) -> float:
+        return self._recorder.elapsed()
+
+
 class MidiTakePlayer:
     """Plays a MidiTake back through note_on(note, velocity)/note_off
     (note) callables at its original recorded timing (unquantized,
@@ -118,7 +188,12 @@ class MidiTakePlayer:
         self.playing = False
         self.position = 0.0
 
-    def play(self, take: MidiTake):
+    def play(self, take: MidiTake, loop: bool = False):
+        """`loop=True` repeats the take indefinitely (jumping back to
+        t=0 after the last event) until stop() is called - used for the
+        "it must repeat automatically" live-looper behavior in
+        synth_studio.py. Default is a single pass, matching a plain
+        "play this once" expectation for any other caller."""
         if take.is_empty():
             return
         if self._thread is not None and self._thread.is_alive():
@@ -129,7 +204,7 @@ class MidiTakePlayer:
         self.position = 0.0
         stop_event = threading.Event()
         self._stop_event = stop_event
-        self._thread = threading.Thread(target=self._run, args=(take, stop_event), daemon=True)
+        self._thread = threading.Thread(target=self._run, args=(take, stop_event, loop), daemon=True)
         self._thread.start()
 
     def stop(self, join=False):
@@ -138,22 +213,28 @@ class MidiTakePlayer:
         if join and self._thread is not None:
             self._thread.join(timeout=2.0)
 
-    def _run(self, take: MidiTake, stop_event: threading.Event):
+    def _run(self, take: MidiTake, stop_event: threading.Event, loop: bool):
         held_notes = set()
         try:
-            t_prev = 0.0
-            for (t, kind, note, velocity) in take.events:
-                wait = t - t_prev
-                if wait > 0 and stop_event.wait(wait):
+            while not stop_event.is_set():
+                t_prev = 0.0
+                for (t, kind, note, velocity) in take.events:
+                    wait = t - t_prev
+                    if wait > 0 and stop_event.wait(wait):
+                        return
+                    t_prev = t
+                    self.position = t
+                    if kind == "note_on":
+                        self.note_on(note, velocity)
+                        held_notes.add(note)
+                    elif kind == "note_off":
+                        self.note_off(note)
+                        held_notes.discard(note)
+                if not loop:
                     break
-                t_prev = t
-                self.position = t
-                if kind == "note_on":
-                    self.note_on(note, velocity)
-                    held_notes.add(note)
-                elif kind == "note_off":
-                    self.note_off(note)
-                    held_notes.discard(note)
+                # Loop straight back to t=0 - no gap is inserted between
+                # repeats (the take's own trailing silence, if any, IS
+                # the gap), so a tightly-timed performance loops cleanly.
         finally:
             for n in held_notes:
                 self.note_off(n)

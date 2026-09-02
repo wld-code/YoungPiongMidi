@@ -41,9 +41,10 @@ Architecture (why threads are split this way):
       that pulls cheap snapshots (SynthEngine.snapshot_for_ui(), the
       waveform ring buffer, SequencerPlayer/MidiTakePlayer state) and
       redraws - it never touches engine/voice/player internals directly.
-      MidiRecorder is fed from this same tick, ingesting the engine's
-      own event_log snapshot - see midi_recorder.py's own header comment
-      for why that means recording needs no per-source wiring at all.
+      LiveRecordSession is fed from this same tick, ingesting the
+      engine's own event_log snapshot - see midi_recorder.py's own
+      header comment for why that means recording needs no per-source
+      wiring at all.
 """
 import argparse
 import os
@@ -58,7 +59,7 @@ from midi_link import find_default_port, note_label, serial_reader_thread
 from synth_instruments import SynthEngine, INSTRUMENTS
 from sequencer import (SequencerModel, SequencerPlayer, step_duration_seconds,
                         NUM_BANKS, NUM_STEPS, MIN_BPM, MAX_BPM, DEFAULT_BPM)
-from midi_recorder import MidiRecorder, MidiTakePlayer, save_midi_file
+from midi_recorder import LiveRecordSession, MidiTakePlayer, save_midi_file
 
 try:
     import tkinter as tk
@@ -157,13 +158,17 @@ class SynthStudioApp:
                                   # in this file for why that's safe without a lock
 
         # One recorded MIDI take slot per bank (parallel to seq_model's
-        # one step-pattern per bank) - Record/Play/Save below all act on
-        # whichever bank is currently selected (self.seq_model.active_bank).
-        self.midi_recorder = MidiRecorder()
-        self.takes = [None] * NUM_BANKS      # MidiTake or None, per bank
-        self._recording_target_bank = None   # bank index locked in when Record starts,
-                                              # so switching banks mid-recording can't
-                                              # retarget where it gets saved on Stop
+        # one step-pattern per bank). While armed, recording always
+        # follows whichever bank is currently selected - the same 8-bank
+        # selector the step sequencer uses - rather than being locked to
+        # one bank for the whole session: default is bank 1 (index 0),
+        # switching banks while armed retargets recording to the new
+        # bank without needing to stop/restart, and a bank's existing
+        # take is only ever replaced when a switch or Stop finalizes a
+        # segment that actually captured a note - see LiveRecordSession's
+        # own docstring for the exact "never silently erases" rule.
+        self.live_record = LiveRecordSession()
+        self.takes = [None] * NUM_BANKS  # MidiTake or None, per bank
         self.take_player = MidiTakePlayer(self.engine.note_on, self.engine.note_off)
         self.last_saved_path = None
 
@@ -180,7 +185,7 @@ class SynthStudioApp:
 
         if auto_close_after is not None:
             self.start_demo()
-            self._run_smoke_test_sequence()
+            self._run_smoke_test_sequence(auto_close_after)
             self.root.after(int(auto_close_after * 1000), self._smoke_test_finish)
 
     # --- UI construction -------------------------------------------------
@@ -502,6 +507,13 @@ class SynthStudioApp:
         self.seq_note_label_var.set(note_label(n))
 
     def _on_bank_select(self, bank_index):
+        # If armed, this both finalizes whatever was captured for the
+        # bank being left (only if non-empty - see LiveRecordSession)
+        # and retargets recording to the new bank, all in one call.
+        finished = self.live_record.set_active_bank(bank_index)
+        if finished is not None:
+            bank, take = finished
+            self.takes[bank] = take
         self.seq_model.select_bank(bank_index)
         self._redraw_seq_bank_buttons()
         self._redraw_seq_steps()
@@ -546,25 +558,27 @@ class SynthStudioApp:
                           highlightbackground="#ffffff" if i == playhead else PANEL_BG)
 
     # --- MIDI take recording (Record / Play take / Save, per bank) ----
+    #
+    # Recording is a live looper, not a one-shot-per-bank capture: while
+    # armed, it always follows whichever bank is currently selected (see
+    # _on_bank_select() above, which retargets it) - by default that's
+    # bank 1. A bank's existing take is only ever overwritten when a
+    # segment that actually captured a note gets finalized for it
+    # (LiveRecordSession guarantees this - see its docstring) - merely
+    # switching to, or arming on top of, a bank that already has a take
+    # never erases it.
     def _toggle_recording(self):
-        if self.midi_recorder.active:
-            take = self.midi_recorder.stop()
+        if self.live_record.armed:
+            finished = self.live_record.disarm()
             self.record_btn.configure(text="● Record", bg="#3a1620", fg="#ffb3c0")
-            target_bank = self._recording_target_bank
-            self._recording_target_bank = None
-            if take.is_empty():
-                self._flash_record_status(f"Bank {target_bank + 1}: nothing recorded (no notes played)")
-                return
-            self.takes[target_bank] = take
+            if finished is not None:
+                bank, take = finished
+                self.takes[bank] = take
             self._update_record_status_label()
         else:
-            # Lock in the target bank now, not at stop time - switching
-            # banks mid-recording (to watch a different pattern play,
-            # say) must not silently retarget where the take lands.
-            self._recording_target_bank = self.seq_model.active_bank
-            self.midi_recorder.start()
+            self.live_record.arm()
             self.record_btn.configure(text="■ Stop Rec", bg="#ff5f5f", fg="#04121f")
-            self.record_status_var.set(f"Bank {self._recording_target_bank + 1}: recording...")
+            self.record_status_var.set(f"Bank {self.live_record.current_bank + 1}: recording...")
 
     def _toggle_take_playback(self):
         take = self.takes[self.seq_model.active_bank]
@@ -572,7 +586,7 @@ class SynthStudioApp:
             self.take_player.stop()
             self.take_play_btn.configure(text="▶ Play take", bg=PANEL_BG, fg=FG)
         elif take is not None and not take.is_empty():
-            self.take_player.play(take)
+            self.take_player.play(take, loop=True)  # loops automatically until Stop
             self.take_play_btn.configure(text="■ Stop take", bg=ACCENT, fg="#04121f")
 
     def _on_save_take(self):
@@ -590,14 +604,14 @@ class SynthStudioApp:
     def _flash_record_status(self, text, hold_ms=2500):
         """Shows `text` immediately, then reverts to the normal per-bank
         take summary after hold_ms - used for one-shot confirmations
-        (saved/nothing-recorded) so they don't get silently overwritten
-        by the very next _tick() before anyone reads them, but also
-        don't sit there stale forever."""
+        (e.g. "saved ...") so they don't get silently overwritten by the
+        very next _tick() before anyone reads them, but also don't sit
+        there stale forever."""
         self.record_status_var.set(text)
         self.root.after(hold_ms, self._update_record_status_label)
 
     def _update_record_status_label(self):
-        if self.midi_recorder.active:
+        if self.live_record.armed:
             return  # _tick() is already showing live elapsed time for this
         bank = self.seq_model.active_bank
         take = self.takes[bank]
@@ -714,7 +728,7 @@ class SynthStudioApp:
         self._tick_count += 1
         snap = self.engine.snapshot_for_ui()
         self.note_history.ingest(snap["events"])
-        self.midi_recorder.ingest(snap["events"])
+        self.live_record.ingest(snap["events"])
         self._draw_waveform()
         self._draw_meter()
         self._draw_piano_roll()
@@ -728,9 +742,9 @@ class SynthStudioApp:
             self.held_var.set("Held: " + ", ".join(parts))
         else:
             self.held_var.set("Held: -")
-        if self.midi_recorder.active:
+        if self.live_record.armed:
             self.record_status_var.set(
-                f"Bank {self._recording_target_bank + 1}: recording... {self.midi_recorder.elapsed():0.1f}s")
+                f"Bank {self.live_record.current_bank + 1}: recording... {self.live_record.elapsed():0.1f}s")
         # The take player can finish on its own (reaching the end of the
         # take) without any button click, so its button state is synced
         # here every tick rather than only from _toggle_take_playback().
@@ -842,53 +856,78 @@ class SynthStudioApp:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    def _run_smoke_test_sequence(self):
-        """Exercises the sequencer + MIDI take recorder end to end, not
-        just the demo riff - programs a small pattern on bank 2, selects
-        it, starts pattern playback (which also feeds the recorder,
-        since it captures whatever the engine actually plays,
-        regardless of source), and arms Record - all through the exact
-        same methods the GUI's own buttons call. Verified in
-        _smoke_test_finish() below, after letting it run for a bit."""
+    def _run_smoke_test_sequence(self, total_seconds):
+        """Exercises the sequencer + live-looper MIDI recorder end to
+        end, not just the demo riff - programs a pattern, starts
+        playback (which also feeds the recorder, since it captures
+        whatever the engine actually plays regardless of source), arms
+        Record on the default bank (bank 1), then - via scheduled
+        callbacks spread across the smoke-test window, not all at once
+        synchronously before anything can actually play - switches to
+        bank 2 (should finalize a real take for bank 1). Demo mode and
+        pattern playback are then stopped (silence - nothing left to
+        generate notes) before switching to bank 5, so bank 5 correctly
+        demonstrates staying empty when nothing was actually played into
+        it - switching to it must not fabricate a take just because it
+        became the target. All verified in _smoke_test_finish() below."""
         self.select_instrument(0)
-        self._on_bank_select(1)  # bank 2 (0-indexed)
         for step_index, note in ((0, 48), (4, 55), (8, 60), (12, 63)):
-            self.seq_model.toggle_step(1, step_index, note)
-        self.seq_model.toggle_accent(1, 8)
+            self.seq_model.toggle_step(0, step_index, note)
+        self.seq_model.toggle_accent(0, 8)
         self.seq_bpm_var.set(180)
-        self._toggle_sequencer()   # start pattern playback
-        self._toggle_recording()   # arm MIDI take recording (bank 2)
+        self._toggle_sequencer()   # start pattern playback (bank 1's pattern)
+        self._toggle_recording()   # arm MIDI take recording - defaults to bank 1
+
+        switch1_ms = int(total_seconds * 1000 * 0.30)
+        go_silent_ms = int(total_seconds * 1000 * 0.55)
+        switch2_ms = int(total_seconds * 1000 * 0.65)
+
+        def go_silent():
+            self.stop_demo()
+            self.seq_player.stop()
+
+        self.root.after(switch1_ms, lambda: self._on_bank_select(1))  # -> bank 2
+        self.root.after(go_silent_ms, go_silent)
+        self.root.after(switch2_ms, lambda: self._on_bank_select(4))  # -> bank 5 (must stay empty: silent by now)
 
     def _smoke_test_finish(self):
         seq_was_playing = self.seq_player.playing
-        if self.midi_recorder.active:
+        if self.live_record.armed:
             self._toggle_recording()  # stop + store, exactly like a user clicking the button
         self.seq_player.stop(join=True)
 
-        take = self.takes[1]  # bank 2, 0-indexed
-        take_ok = take is not None and not take.is_empty()
+        bank1_ok = self.takes[0] is not None and not self.takes[0].is_empty()
+        bank2_ok = self.takes[1] is not None and not self.takes[1].is_empty()
+        bank5_empty = self.takes[4] is None  # never played into - must NOT have been created
+
         saved_path = None
-        if take_ok:
+        if bank1_ok:
+            self._on_bank_select(0)
             self._on_save_take()
             saved_path = self.last_saved_path
         save_ok = saved_path is not None and os.path.exists(saved_path) and os.path.getsize(saved_path) > 20
 
-        # Also exercise take playback itself, not just capture+save.
+        # Also exercise take playback itself (looping), not just capture+save.
         take_playback_ran = False
-        if take_ok:
+        if bank1_ok:
             self._toggle_take_playback()
             take_playback_ran = self.take_player.playing
+            time.sleep(0.05)
+            still_playing_after_a_moment = self.take_player.playing  # loop=True: must not have stopped on its own
             self.take_player.stop(join=True)
+            take_playback_ran = take_playback_ran and still_playing_after_a_moment
 
-        take_summary = (f"take_captured=True ({take.note_on_count()} notes, {take.duration:.1f}s)"
-                         if take_ok else "take_captured=False")
         print(f"[smoke-test] {self._tick_count} UI redraw ticks completed without exception, "
               f"active_voices last seen={self.engine.snapshot_for_ui()['active_voices']}, "
               f"connection_status={self.connection_status!r}, "
               f"events_logged={len(self.engine.event_log)}, "
               f"sequencer_was_playing={seq_was_playing}, "
-              f"{take_summary}, "
-              f"take_played_back={take_playback_ran}, "
+              f"bank1_take_captured={bank1_ok} "
+              f"({self.takes[0].note_on_count() if bank1_ok else 0} notes), "
+              f"bank2_take_captured_after_bank_switch={bank2_ok} "
+              f"({self.takes[1].note_on_count() if bank2_ok else 0} notes), "
+              f"bank5_correctly_left_empty={bank5_empty}, "
+              f"take_looped_without_stopping={take_playback_ran}, "
               f"take_saved={save_ok} ({saved_path})")
         self._on_close()
 
