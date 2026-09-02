@@ -25,16 +25,15 @@ Requires: pyserial, numpy, sounddevice (`pip install pyserial numpy
 sounddevice`).
 """
 import argparse
-import glob
 import math
-import re
 import sys
 import threading
 import time
 
 import numpy as np
 import sounddevice as sd
-import serial
+
+from midi_link import find_default_port, note_label, midi_note_to_freq, serial_reader_thread
 
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 256
@@ -63,10 +62,6 @@ BASE_RESONANCE_Q = 2.2    # SVF q; higher number = LESS resonant (see chamberlin
 ACCENT_RESONANCE_Q = 1.0  # q at full accent (more resonant/squealy)
 MAX_STATE = 8.0           # hard safety clamp on filter state, see above
 MASTER_GAIN = 0.35
-
-
-def midi_note_to_freq(note: int) -> float:
-    return 440.0 * (2.0 ** ((note - 69) / 12.0))
 
 
 class SharedMidiState:
@@ -201,61 +196,6 @@ class AcidVoice:
         return out
 
 
-LOG_NOTE_ON = re.compile(r"NOTE_ON\s+ch=(\d+)\s+note=(\d+)\s+vel=(\d+)")
-LOG_NOTE_OFF = re.compile(r"NOTE_OFF\s+ch=(\d+)\s+note=(\d+)\s+vel=(\d+)")
-LOG_CC = re.compile(r"CC\s+ch=(\d+)\s+cc=(\d+)\s+val=(\d+)")
-
-NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-
-
-def note_label(note: int) -> str:
-    return f"{NOTE_NAMES[note % 12]}{note // 12 - 1}"
-
-
-def find_default_port() -> str:
-    candidates = sorted(glob.glob("/dev/cu.usbmodem*"))
-    if not candidates:
-        print("No /dev/cu.usbmodem* port found - pass --port explicitly.", file=sys.stderr)
-        sys.exit(1)
-    return candidates[0]
-
-
-def serial_reader_thread(port: str, baud: int, state: SharedMidiState, stop_event: threading.Event):
-    ser = serial.Serial(port, baud, timeout=0.5)
-    print(f"[serial] listening on {port} @ {baud}")
-    try:
-        while not stop_event.is_set():
-            raw = ser.readline()
-            if not raw:
-                continue
-            try:
-                line = raw.decode(errors="replace").rstrip()
-            except Exception:
-                continue
-
-            m = LOG_NOTE_ON.search(line)
-            if m:
-                ch, note, vel = (int(x) for x in m.groups())
-                state.note_on(note, vel)
-                print(f"  NOTE_ON  ch={ch} {note_label(note):<4} (midi={note:3d}) vel={vel:3d}")
-                continue
-
-            m = LOG_NOTE_OFF.search(line)
-            if m:
-                ch, note, vel = (int(x) for x in m.groups())
-                state.note_off(note)
-                print(f"  NOTE_OFF ch={ch} {note_label(note):<4} (midi={note:3d})")
-                continue
-
-            m = LOG_CC.search(line)
-            if m:
-                ch, cc, val = (int(x) for x in m.groups())
-                state.cc(cc, val)
-                continue
-    finally:
-        ser.close()
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", default=None, help="serial port (default: auto-detect /dev/cu.usbmodem*)")
@@ -302,7 +242,34 @@ def main():
         threading.Thread(target=self_test_thread, daemon=True).start()
     else:
         port = args.port or find_default_port()
-        reader = threading.Thread(target=serial_reader_thread, args=(port, args.baud, state, stop_event), daemon=True)
+        if port is None:
+            print("No /dev/cu.usbmodem* port found - pass --port explicitly.", file=sys.stderr)
+            sys.exit(1)
+
+        def on_connect(p):
+            print(f"[serial] listening on {p} @ {args.baud}")
+
+        def on_note_on(ch, note, vel):
+            state.note_on(note, vel)
+            print(f"  NOTE_ON  ch={ch} {note_label(note):<4} (midi={note:3d}) vel={vel:3d}")
+
+        def on_note_off(ch, note, vel):
+            del vel
+            state.note_off(note)
+            print(f"  NOTE_OFF ch={ch} {note_label(note):<4} (midi={note:3d})")
+
+        def on_cc(ch, cc, val):
+            del ch
+            state.cc(cc, val)
+
+        def on_error(exc):
+            print(f"[serial] error on {port}: {exc}", file=sys.stderr)
+
+        reader = threading.Thread(
+            target=serial_reader_thread,
+            args=(port, args.baud, on_note_on, on_note_off, on_cc, stop_event),
+            kwargs={"on_connect": on_connect, "on_error": on_error},
+            daemon=True)
         reader.start()
 
     if args.record_seconds is not None:

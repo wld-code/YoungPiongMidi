@@ -34,6 +34,7 @@ make build/test_pitch && ./build/test_pitch
 | `test_note_state_machine.c` | `components/voice_midi/note_state_machine.c` | the spec's own anti-flicker requirement (60 frames of +/-15-cent jitter around a held note -> zero events), Note On only after `YP_NOTE_MIN_STABLE_FRAMES`, Note Off only after `YP_NOTE_RELEASE_FRAMES` (and *not* on a shorter dropout that recovers), a note change withheld until `YP_NOTE_MIN_DURATION_MS` has elapsed, low confidence never triggering anything, and Note On velocity actually reflecting the triggering hop's level |
 | `test_dynamics.c` | `yp_level_to_velocity` in `components/voice_midi/voice_midi.c` | bounds/clamping/monotonicity for both curves, the log curve landing close to the spec's own example mapping (soft/normal/strong voice -> ~20/~70/~120), and a measured demonstration that the log curve reads meaningfully higher than linear at ordinary levels (the spec's explicit warning against "poor musical behaviour" from a simple linear mapping) |
 | `test_expression.c` | `components/voice_midi/expression.c` (`yp_expression_process`, CC11 throttling) | the first call after init always sends (baseline); an unchanged level never resends; a sub-`YP_CC11_MIN_DELTA` change never sends regardless of elapsed time (delta gate, tested independently); a large delta is still withheld until `YP_CC11_MIN_INTERVAL_MS` has passed (interval gate, tested independently); sends exactly once both gates pass; louder -> higher CC11, softer -> lower (the spec's own example); `yp_level_to_cc_value`'s full 0..127 range and clamping |
+| `test_noise_gate.c` | `components/audio_dsp/noise_gate.c` (the adaptive VAD threshold) | the floor adapts down toward genuine quiet; a loud, sustained, *open-gate* signal (real voice) never raises the floor under itself; sustained noise the gate never trusted (closed) does eventually raise the floor (self-correcting); the returned threshold never collapses below the configured minimum; and the end-to-end shape (quiet room settles low, a real voice still clears the settled threshold) |
 
 `test_common.h` is a ~60-line assert-style framework (not a dependency on
 Unity/CMock/etc - the code under test is a handful of pure functions, and
@@ -45,8 +46,8 @@ pass/fail.
 ## Why these functions specifically are host-testable
 
 `rms.c`, `envelope.c`, `yin.c`, `voice_midi.c` (which includes
-`yp_level_to_velocity`/`yp_level_to_cc_value`), `note_state_machine.c`
-and `expression.c` have zero ESP-IDF dependency by design - they only ever include
+`yp_level_to_velocity`/`yp_level_to_cc_value`), `note_state_machine.c`,
+`expression.c`, and `noise_gate.c` have zero ESP-IDF dependency by design - they only ever include
 `yp_config.h` (plain macros) and the C standard library (`<math.h>`,
 `<string.h>`, ...). That is not an accident of these particular files; it
 is why they were kept free of `esp_log.h`/FreeRTOS/etc in the first

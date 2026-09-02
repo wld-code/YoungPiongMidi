@@ -8,7 +8,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-ESP32--C5-blue?logo=espressif)](docs/hardware.md)
 [![Framework](https://img.shields.io/badge/framework-ESP--IDF%20v5.5%2B-green)](https://docs.espressif.com/projects/esp-idf/)
-[![Tests](https://img.shields.io/badge/host%20tests-520%20passing-brightgreen)](test/README.md)
+[![Tests](https://img.shields.io/badge/host%20tests-996%20passing-brightgreen)](test/README.md)
 [![License](https://img.shields.io/badge/license-MIT-informational)](LICENSE)
 
 [Quick start](#-quick-start) ·
@@ -42,8 +42,8 @@ instrument. It preserves two musical properties of the voice, not just
 | | |
 |---|---|
 | ✅ **Working, on real hardware, right now** | Mic → pitch → MIDI note → velocity → CC11 → sound, entirely on-device |
-| 🔊 **You can already hear it** | Board's own speaker, or `tools/acid_synth_monitor.py` on a computer |
-| 🧪 **520 host-side test checks** | No board required - `cd test && make` |
+| 🔊 **You can already hear it** | Board's own speaker, `tools/acid_synth_monitor.py`, or the full `tools/synth_studio.py` GUI |
+| 🧪 **996 host-side test checks** | No board required - `cd test && make` |
 | 🚧 **Not yet implemented** | A wire MIDI transport (BLE/UART) and pitch bend - see [Roadmap](#-roadmap) |
 
 Every item marked done below has been built **and verified on the
@@ -128,6 +128,9 @@ docs/
                      principles, with diagrams
 test/               Host-side tests (real, passing - see test/README.md)
 tools/              acid_synth_monitor.py - real-time audio monitor
+                    synth_studio.py       - 10-instrument GUI synth + live
+                                             waveform/MIDI/melody view
+                    midi_link.py          - shared serial-MIDI-log parsing
 ```
 
 ## 🛠️ Build & flash
@@ -155,7 +158,7 @@ make            # builds and runs every suite; fails loudly on any failure
 ```
 
 No ESP-IDF or board required - see [`test/README.md`](test/README.md)
-for what each suite checks. As of this writing: **520 checks across 7
+for what each suite checks. As of this writing: **996 checks across 8
 suites, all passing**, including:
 
 - a direct test of the spec's own anti-flicker requirement (*"a small
@@ -167,6 +170,9 @@ suites, all passing**, including:
 - an explicit, independent check of the CC11 throttle's two gates (value
   delta **and** minimum interval) - see [`docs/midi.md`](docs/midi.md)
   for why both are required rather than either alone
+- a direct test of the adaptive noise gate's key asymmetry (a loud,
+  open-gate voice never raises its own threshold; noise the gate never
+  trusted eventually does) - see [`docs/dsp.md`](docs/dsp.md)
 
 ## 🔊 Hearing MIDI output before Milestone 8/9 exist
 
@@ -215,6 +221,48 @@ Both voices are deliberately simple oscillators, not full synthesizers -
 see [`docs/tutorials/07-audio-synthesis-pdm.md`](docs/tutorials/07-audio-synthesis-pdm.md)
 for why, including a real numerical-instability bug found (and avoided
 on-device) while building the richer Python one.
+
+## 🎹 `tools/synth_studio.py` - full GUI synth studio
+
+A real-time desktop app (Tkinter, no extra GUI framework needed) that
+turns the board's serial MIDI log into a proper playable instrument on
+the computer, with 10 selectable instruments and a live view of what the
+board is doing:
+
+```sh
+pip install pyserial numpy sounddevice
+python3 tools/synth_studio.py
+```
+
+- **10 instruments**, switchable live without interrupting a held note:
+  Acid Bass (the same TB-303-style resonant voice as the monitor tool
+  above), Sine Lead, Square Lead, Saw Pad, FM Bell, Pluck
+  (Karplus-Strong string), Sub Bass, Brass, Organ, Vibraphone.
+- **Live waveform**, a VU-style level meter, and a scrolling piano-roll
+  of the actual melody the board is generating - not a mockup, driven by
+  the same NOTE_ON/NOTE_OFF/CC log line the onboard synth and
+  `acid_synth_monitor.py` read.
+- A scrolling **MIDI event log**, an **output-device picker** in the app
+  itself (macOS can silently default audio to a disconnected Bluetooth
+  device - this makes that visible and one click to fix instead of a
+  restart with `--device N`), **Test Note** and **Panic** buttons, and a
+  **Demo mode** that plays a fixed riff with no board attached, for
+  trying the instruments before singing into the mic.
+
+> [!NOTE]
+> This is a GUI application - its window and layout can't be verified by
+> an automated coding agent that has no eyes on the screen. What *was*
+> verified: the underlying synth engine (`tools/synth_instruments.py`)
+> has its own headless test suite (`python3 tools/test_synth_engine.py`)
+> checking all 10 instruments for finite, non-silent, non-clipping
+> output under both normal use and an adversarial rapid-note-change/
+> voice-stealing stress test - which caught two real envelope bugs (FM
+> Bell and Pluck were silently producing zero output) before this was
+> ever handed over. The app itself was also smoke-tested end to end
+> (opened, connected to the real board's serial port, ran ~30 redraw
+> ticks/second with no exceptions, played the demo riff, closed cleanly)
+> - see the class docstrings in `tools/synth_studio.py` for exactly what
+> that does and doesn't prove.
 
 ## 📖 How to use it
 
@@ -272,7 +320,7 @@ the onboard synth's round-trip audio latency is ~12ms.
 >   task-queue hop - both fixed, verified down to ~12ms.
 
 The note-stabilization state machine's and velocity mapping's *logic* is
-verified by 256 of the 520 host-side test checks rather than a live
+verified by 256 of the 996 host-side test checks rather than a live
 singing session in any one verification pass - deliberately: their
 correctness lives in exact frame-by-frame/millisecond-boundary behavior
 that a host test can assert on deterministically and a live mic session
