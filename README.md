@@ -266,32 +266,43 @@ python3 tools/synth_studio.py
   sequencer. Sequencer notes go through the exact same engine call as a
   note from the board, so they show up in the waveform/log/piano-roll
   for free.
+- **Record your voice straight into the step pattern**
+  (`tools/sequencer.py`'s `StepRecorder`): while **Record** is armed,
+  singing/playing (from the board, Demo mode, or Test Note - anything
+  that isn't the pattern echoing its own steps or a take replaying)
+  writes each note straight into the currently-playing bank's grid,
+  quantized to whichever step is active at that instant - so the
+  pattern itself changes and loops what you just sang. Singing louder
+  (velocity at or above 110) accents the step automatically, the same
+  as a manual right-click. Only the exact step a note lands on is ever
+  touched - every other step (hand-programmed or previously recorded)
+  is left completely alone, so nothing gets erased just by arming
+  Record or switching banks, only by an actual new note landing on that
+  specific step. **Record and Play take both automatically start the
+  step sequencer's pattern playback if it isn't already running** (and
+  never stop it - Play pattern/Stop still owns that), so pressing either
+  one always has something actually looping to record into or
+  accompany, instead of silently capturing nothing.
 - **Live MIDI recording, a looper with one take per bank**
-  (`tools/midi_recorder.py`): **Record** arms real-time capture of
-  whatever notes actually happen next - from the board (singing/
-  playing), the step sequencer, Demo mode, or the Test Note button, all
-  of it, unquantized, at their real timing. Recording always follows
-  whichever bank is currently selected (default: bank 1) - switching
-  banks *while armed* finalizes what you just captured and immediately
-  starts capturing into the new bank instead, no need to stop and
-  restart Record for each one. A bank's existing take is only ever
-  replaced once a switch (or Stop) finalizes a segment that actually
-  captured a note - just landing on, or re-arming over, a bank that
-  already has one never erases it. **Record and Play take both
-  automatically start the step sequencer's pattern playback if it isn't
-  already running** (and never stop it - Play pattern/Stop still owns
-  that), so pressing either one always has something actually looping
-  to capture or accompany instead of silently recording nothing; since
-  a running pattern already re-reads the active bank on every step, it
-  stays in sync with recording's own bank-following for free. **Play
-  take** loops that bank's captured performance at its original timing,
-  repeating automatically until Stop; **💾 Save** exports it as a
-  standard `.mid` file under `tools/recordings/` (gitignored) - a real,
-  DAW-importable MIDI recording, not audio. This is a genuinely
-  different thing from the step sequencer above (a fixed 16-step grid
-  you program by hand) - it's a live take of an actual performance, the
-  same idea as a
-  hardware loop pedal or a DAW's Session View.
+  (`tools/midi_recorder.py`): in parallel with writing into the step
+  grid above, **Record** also captures the exact same performance
+  unquantized, at its real timing, as a separate "take" - useful for an
+  accurate export the quantized grid can't represent. Recording always
+  follows whichever bank is currently selected (default: bank 1) -
+  switching banks *while armed* finalizes what you just captured and
+  immediately starts capturing into the new bank instead, no need to
+  stop and restart Record for each one. A bank's existing take is only
+  ever replaced once a switch (or Stop) finalizes a segment that
+  actually captured a note - just landing on, or re-arming over, a bank
+  that already has one never erases it. **Play take** loops that bank's
+  captured performance at its original timing, repeating automatically
+  until Stop; **💾 Save** exports it as a standard `.mid` file under
+  `tools/recordings/` (gitignored) - a real, DAW-importable MIDI
+  recording, not audio, and the one place your performance's exact,
+  unquantized timing survives (the step grid it also writes into is
+  necessarily quantized to 16 steps) - the same idea as a hardware loop
+  pedal or a DAW's Session View clip, recorded alongside the pattern it
+  produced rather than instead of it.
 - **Live waveform**, a VU-style level meter, and a scrolling piano-roll
   of the actual melody being generated - not a mockup, driven by the
   same NOTE_ON/NOTE_OFF/CC log line the onboard synth and
@@ -315,11 +326,18 @@ python3 tools/synth_studio.py
 >   an adversarial rapid-note-change/voice-stealing stress test - caught
 >   two real envelope bugs (FM Bell and Pluck were silently producing
 >   zero output).
-> - **Sequencer correctness** (`python3 tools/test_sequencer.py`,
->   headless): tempo math, step ordering/gating, accent velocity, bank
->   switching mid-playback, and a real threading race caught and fixed
->   (a fast Stop-then-Play could silently no-op, or - worse - leave an
->   orphaned background thread still firing notes after a restart).
+> - **Sequencer + step-recorder correctness** (`python3
+>   tools/test_sequencer.py`, 67 headless checks): tempo math, step
+>   ordering/gating, accent velocity, bank switching mid-playback, a real
+>   threading race caught and fixed (a fast Stop-then-Play could
+>   silently no-op, or - worse - leave an orphaned background thread
+>   still firing notes after a restart), and `StepRecorder` - external
+>   notes land on the correct step and accent correctly by velocity,
+>   the pattern's own notes and take-playback notes are never written
+>   back into the grid (no self-write-back/take-of-a-take loop), an
+>   existing step survives untouched unless a new note actually lands
+>   on it, and bank switches are followed with zero extra wiring since
+>   it always writes into whichever bank is currently active.
 > - **MIDI recorder correctness** (`python3 tools/test_midi_recorder.py`,
 >   69 headless checks): capture timing/ordering/dedup, playback firing
 >   the right notes at the right times with no stuck notes on an early

@@ -334,7 +334,16 @@ class SynthEngine:
         with self.lock:
             self.current_instrument = max(0, min(len(INSTRUMENTS) - 1, instrument_id))
 
-    def note_on(self, note: int, velocity: int):
+    def note_on(self, note: int, velocity: int, source: str = "external"):
+        """`source` tags where this note came from in the logged event
+        (defaults to "external" - the board, Demo mode, the Test Note
+        button, etc. all fall under that with zero call-site changes).
+        Only the sequencer's own pattern playback and take playback tag
+        themselves otherwise (synth_studio.py wires those wrapped) - so
+        StepRecorder (sequencer.py) can tell "someone actually played
+        something" apart from "the pattern/a take is just repeating
+        what's already there" and never write either of those back into
+        the step grid it's recording into."""
         with self.lock:
             self._age_counter += 1
             # Prefer an idle voice; otherwise steal the oldest active one
@@ -344,15 +353,16 @@ class SynthEngine:
                 voice = min(self.voices, key=lambda v: v.age)
             voice.trigger(self.current_instrument, note, velocity, self.sr, self._age_counter)
             self.held_notes[note] = (self.current_instrument, velocity, time.time())
-            self._log("note_on", note=note, velocity=velocity, instrument=self.current_instrument)
+            self._log("note_on", note=note, velocity=velocity, instrument=self.current_instrument,
+                      source=source)
 
-    def note_off(self, note: int):
+    def note_off(self, note: int, source: str = "external"):
         with self.lock:
             for v in self.voices:
                 if v.active and v.note == note and v.gate:
                     v.note_off()
             self.held_notes.pop(note, None)
-            self._log("note_off", note=note)
+            self._log("note_off", note=note, source=source)
 
     def cc(self, controller: int, value: int):
         if controller == 11:

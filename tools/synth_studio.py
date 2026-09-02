@@ -57,7 +57,7 @@ import numpy as np
 
 from midi_link import find_default_port, note_label, serial_reader_thread
 from synth_instruments import SynthEngine, INSTRUMENTS
-from sequencer import (SequencerModel, SequencerPlayer, step_duration_seconds,
+from sequencer import (SequencerModel, SequencerPlayer, StepRecorder, step_duration_seconds,
                         NUM_BANKS, NUM_STEPS, MIN_BPM, MAX_BPM, DEFAULT_BPM)
 from midi_recorder import LiveRecordSession, MidiTakePlayer, save_midi_file
 
@@ -151,8 +151,16 @@ class SynthStudioApp:
         self._tick_count = 0
 
         self.seq_model = SequencerModel()
-        self.seq_player = SequencerPlayer(self.seq_model, self.engine.note_on, self.engine.note_off,
-                                           on_step=self._on_seq_step)
+        # Wrapped so the pattern's own notes are tagged source="pattern"
+        # in the engine's event log - this is what lets StepRecorder
+        # below tell "the pattern is just repeating itself" apart from
+        # "someone (a voice, Demo, Test Note) actually played
+        # something", and never write the former back into the grid.
+        self.seq_player = SequencerPlayer(
+            self.seq_model,
+            lambda note, vel: self.engine.note_on(note, vel, source="pattern"),
+            lambda note: self.engine.note_off(note, source="pattern"),
+            on_step=self._on_seq_step)
         self._seq_playhead = -1  # written from the player thread, read from the Tk thread each
                                   # tick - a single int assignment, same reasoning as elsewhere
                                   # in this file for why that's safe without a lock
@@ -169,7 +177,19 @@ class SynthStudioApp:
         # own docstring for the exact "never silently erases" rule.
         self.live_record = LiveRecordSession()
         self.takes = [None] * NUM_BANKS  # MidiTake or None, per bank
-        self.take_player = MidiTakePlayer(self.engine.note_on, self.engine.note_off)
+        # Record ALSO writes what you sing/play straight into the step
+        # grid in real time, quantized to whichever step is currently
+        # playing - see StepRecorder's own docstring. This is the actual
+        # primary "record my voice into the sequencer" workflow; the
+        # freeform MidiTake above exists in parallel for accurate,
+        # unquantized .mid export/playback of the same performance.
+        self.step_recorder = StepRecorder(self.seq_model)
+        # Tagged so a played-back take's notes never get step-recorded
+        # into the grid (avoids a take-of-a-take feedback loop if Record
+        # happens to be armed while a take is also playing).
+        self.take_player = MidiTakePlayer(
+            lambda note, vel: self.engine.note_on(note, vel, source="take_playback"),
+            lambda note: self.engine.note_off(note, source="take_playback"))
         self.last_saved_path = None
 
         self._build_ui()
@@ -586,6 +606,7 @@ class SynthStudioApp:
     # never erases it.
     def _toggle_recording(self):
         if self.live_record.armed:
+            self.step_recorder.disarm()
             finished = self.live_record.disarm()
             self.record_btn.configure(text="● Record", bg="#3a1620", fg="#ffb3c0")
             if finished is not None:
@@ -595,6 +616,7 @@ class SynthStudioApp:
         else:
             self._ensure_pattern_playing()
             self.live_record.arm()
+            self.step_recorder.arm()
             self.record_btn.configure(text="■ Stop Rec", bg="#ff5f5f", fg="#04121f")
             self.record_status_var.set(f"Bank {self.live_record.current_bank + 1}: recording...")
 
@@ -748,6 +770,7 @@ class SynthStudioApp:
         snap = self.engine.snapshot_for_ui()
         self.note_history.ingest(snap["events"])
         self.live_record.ingest(snap["events"])
+        self.step_recorder.ingest(snap["events"], self.seq_player.current_step)
         self._draw_waveform()
         self._draw_meter()
         self._draw_piano_roll()

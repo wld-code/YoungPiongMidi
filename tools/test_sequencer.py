@@ -7,9 +7,9 @@ no board. Run with: python3 tools/test_sequencer.py
 import sys
 import time
 
-from sequencer import (SequencerModel, SequencerPlayer, Step, step_duration_seconds,
+from sequencer import (SequencerModel, SequencerPlayer, StepRecorder, Step, step_duration_seconds,
                         clamp_bpm, NUM_BANKS, NUM_STEPS, MIN_BPM, MAX_BPM,
-                        DEFAULT_VELOCITY, ACCENT_VELOCITY)
+                        DEFAULT_VELOCITY, ACCENT_VELOCITY, STEP_RECORD_ACCENT_VELOCITY_THRESHOLD)
 
 failures = []
 
@@ -82,6 +82,23 @@ def test_model_basics():
 
     m.set_bpm(500)
     check("set_bpm clamps", m.bpm == MAX_BPM)
+
+
+def test_set_step_overwrite_semantics():
+    m = SequencerModel()
+    step = m.set_step(0, 3, note=67)
+    check("set_step turns a step on with the given note", step.on and step.note == 67 and not step.accent)
+    check("set_step's returned step is the same object stored in the bank", m.banks[0][3] is step)
+
+    step2 = m.set_step(0, 3, note=70)
+    check("set_step on an already-on step overwrites (not toggles off)", step2.on and step2.note == 70)
+
+    step3 = m.set_step(0, 3, note=72, accent=True)
+    check("set_step can set accent explicitly", step3.accent)
+    step4 = m.set_step(0, 3, note=74)
+    check("a later set_step without accent=True clears any previous accent", not step4.accent)
+
+    check("set_step never touches any other step", not m.banks[0][2].on and not m.banks[0][4].on)
 
 
 def test_player_plays_correct_pattern_in_order():
@@ -261,14 +278,150 @@ def test_restart_while_previous_thread_still_alive_leaves_no_orphan():
           f"events={events}")
 
 
+# --- StepRecorder ("record my voice/playing into the pattern") ------------
+
+def _evt(rec, delta, note, velocity=100, source=None):
+    """Builds a synthetic event timestamped relative to `rec`'s own
+    ingestion cursor (which arm() sets to a real time.time(), same as
+    production) rather than an arbitrary small literal - StepRecorder's
+    dedup compares against real wall-clock magnitudes, so a literal
+    like t=1.0 would already be "in the past" the instant arm() runs
+    and get silently skipped, same reasoning as the wall-clock
+    precision note on MidiRecorder's own tests in test_midi_recorder.py."""
+    e = {"t": rec._last_seen_ts + delta, "kind": "note_on", "note": note, "velocity": velocity}
+    if source is not None:
+        e["source"] = source
+    return e
+
+
+def test_step_recorder_writes_external_note_into_current_step():
+    m = SequencerModel()
+    rec = StepRecorder(m)
+    check("starts unarmed", not rec.armed)
+    rec.arm()
+    check("armed after arm()", rec.armed)
+
+    rec.ingest([_evt(rec, 0.01, note=64)], current_step=5)
+    step = m.banks[0][5]
+    check("an external note_on lands on the given current_step", step.on and step.note == 64,
+          f"got on={step.on} note={step.note}")
+    check("no other step was touched", not any(m.banks[0][i].on for i in range(NUM_STEPS) if i != 5))
+
+
+def test_step_recorder_ignores_pattern_and_take_playback_sourced_notes():
+    m = SequencerModel()
+    rec = StepRecorder(m)
+    rec.arm()
+    rec.ingest([_evt(rec, 0.01, note=60, source="pattern")], current_step=3)
+    check("a source='pattern' note_on is never written into the grid (no self-write-back)",
+          not m.banks[0][3].on)
+
+    rec.ingest([_evt(rec, 0.02, note=61, source="take_playback")], current_step=3)
+    check("a source='take_playback' note_on is also ignored (no take-of-a-take loop)",
+          not m.banks[0][3].on)
+
+    rec.ingest([_evt(rec, 0.03, note=62)], current_step=3)  # no source key at all -> defaults to external
+    check("a note_on with no source key at all defaults to external and IS recorded",
+          m.banks[0][3].on and m.banks[0][3].note == 62)
+
+
+def test_step_recorder_ignores_note_off_and_non_note_events():
+    m = SequencerModel()
+    rec = StepRecorder(m)
+    rec.arm()
+    rec.ingest([{"t": rec._last_seen_ts + 0.01, "kind": "note_off", "note": 60}], current_step=2)
+    rec.ingest([{"t": rec._last_seen_ts + 0.02, "kind": "cc", "controller": 11, "value": 90}],
+               current_step=2)
+    check("note_off and cc events never write into the grid", not m.banks[0][2].on)
+
+
+def test_step_recorder_ignored_while_disarmed():
+    m = SequencerModel()
+    rec = StepRecorder(m)
+    rec.ingest([_evt(rec, 0.01, note=64)], current_step=5)  # never armed (_last_seen_ts still 0.0)
+    check("ingest() before arm() is a no-op", not m.banks[0][5].on)
+
+    rec.arm()
+    rec.disarm()
+    rec.ingest([_evt(rec, 0.02, note=64)], current_step=5)
+    check("ingest() after disarm() is also a no-op", not m.banks[0][5].on)
+
+
+def test_step_recorder_ignores_notes_when_pattern_not_running():
+    m = SequencerModel()
+    rec = StepRecorder(m)
+    rec.arm()
+    rec.ingest([_evt(rec, 0.01, note=64)], current_step=-1)  # SequencerPlayer.current_step when stopped
+    check("current_step=-1 (pattern not running) means nothing gets written anywhere",
+          not any(s.on for s in m.banks[0]))
+
+
+def test_step_recorder_high_velocity_sets_accent():
+    m = SequencerModel()
+    rec = StepRecorder(m)
+    rec.arm()
+    rec.ingest([_evt(rec, 0.01, note=60, velocity=STEP_RECORD_ACCENT_VELOCITY_THRESHOLD)], current_step=0)
+    check("velocity at the accent threshold sets accent", m.banks[0][0].accent)
+
+    rec.ingest([_evt(rec, 0.02, note=61, velocity=STEP_RECORD_ACCENT_VELOCITY_THRESHOLD - 1)], current_step=1)
+    check("velocity just below the threshold does not set accent", not m.banks[0][1].accent)
+
+
+def test_step_recorder_overwrites_only_when_a_new_note_actually_lands():
+    """The literal requirement: switching to (or arming over) a bank/
+    step with existing content must never erase it - only an actual new
+    note landing on that exact step does."""
+    m = SequencerModel()
+    m.set_step(0, 4, note=48)  # pre-existing content, as if hand-programmed
+    rec = StepRecorder(m)
+    rec.arm()
+
+    rec.ingest([_evt(rec, 0.01, note=99)], current_step=7)  # a note lands elsewhere
+    check("an existing step is untouched when a note lands on a different step",
+          m.banks[0][4].on and m.banks[0][4].note == 48)
+
+    rec.ingest([_evt(rec, 0.02, note=55)], current_step=4)  # a note lands ON the pre-existing step
+    check("a new note landing exactly on an existing step legitimately overwrites it",
+          m.banks[0][4].on and m.banks[0][4].note == 55)
+
+
+def test_step_recorder_follows_bank_switches_with_zero_extra_wiring():
+    """Unlike LiveRecordSession, StepRecorder never has to be told about
+    a bank switch - it always writes into model.active_bank, so
+    changing that (as the GUI's bank selector does) is immediately
+    reflected on the very next ingest(), with no set_active_bank() call
+    needed at all."""
+    m = SequencerModel()
+    rec = StepRecorder(m)
+    rec.arm()
+    rec.ingest([_evt(rec, 0.01, note=60)], current_step=0)
+    check("recorded into bank 0 (the model's default active bank)", m.banks[0][0].on)
+
+    m.select_bank(3)
+    rec.ingest([_evt(rec, 0.02, note=67)], current_step=0)
+    check("after the model's active bank changes, the very next note goes to the new bank",
+          m.banks[3][0].on and m.banks[3][0].note == 67)
+    check("bank 0's earlier content is untouched by the switch", m.banks[0][0].note == 60)
+
+
 def main():
     test_step_duration_math()
     test_model_basics()
+    test_set_step_overwrite_semantics()
     test_player_plays_correct_pattern_in_order()
     test_bank_switch_mid_playback_takes_effect_next_step()
     test_stop_turns_off_a_currently_held_note()
     test_rapid_stop_then_start_does_not_silently_no_op()
     test_restart_while_previous_thread_still_alive_leaves_no_orphan()
+
+    test_step_recorder_writes_external_note_into_current_step()
+    test_step_recorder_ignores_pattern_and_take_playback_sourced_notes()
+    test_step_recorder_ignores_note_off_and_non_note_events()
+    test_step_recorder_ignored_while_disarmed()
+    test_step_recorder_ignores_notes_when_pattern_not_running()
+    test_step_recorder_high_velocity_sets_accent()
+    test_step_recorder_overwrites_only_when_a_new_note_actually_lands()
+    test_step_recorder_follows_bank_switches_with_zero_extra_wiring()
 
     print()
     if failures:

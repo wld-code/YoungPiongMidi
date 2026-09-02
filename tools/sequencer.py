@@ -97,6 +97,20 @@ class SequencerModel:
             step.accent = not step.accent
         return step
 
+    def set_step(self, bank_index: int, step_index: int, note: int, accent: bool = False) -> Step:
+        """Unconditionally sets a step ON with `note` (overwrite, not
+        toggle-off-if-already-on) - unlike toggle_step(), meant for
+        live step-recording (StepRecorder below): "this step now holds
+        this note" regardless of the step's prior state. Never touches
+        any other step, so a bank being recorded into is only ever
+        changed one step at a time, exactly where a new note actually
+        landed - see StepRecorder's own docstring for why that matters."""
+        step = self.banks[bank_index][step_index]
+        step.on = True
+        step.note = note
+        step.accent = accent
+        return step
+
     def clear_bank(self, bank_index: int):
         self.banks[bank_index] = [Step() for _ in range(NUM_STEPS)]
 
@@ -205,3 +219,85 @@ class SequencerPlayer:
                 self.note_off(held_note)
             self.current_step = -1
             self.playing = False
+
+
+# Velocity at/above which a step-recorded note is written in as
+# accented, mirroring the manual "right-click to accent" gesture -
+# singing/playing louder accents the step automatically.
+STEP_RECORD_ACCENT_VELOCITY_THRESHOLD = 110
+
+
+class StepRecorder:
+    """Writes incoming *external* (i.e. not the pattern's own output -
+    see the `source` check below) note_on events straight into a
+    SequencerModel's step grid in real time, quantized to whichever
+    step is currently playing: "record my singing into the pattern"
+    step-record, the same idea as a hardware groovebox's real-time
+    record mode - sing/play a note while the pattern loops and it lands
+    on whatever step is currently active, overwriting only that one
+    step (SequencerModel.set_step(), not toggle_step()) with the new
+    note. A step nothing is ever played into during a recording session
+    is left completely untouched - the "never erases unless you
+    actually play a sound" property is automatic here, not something
+    this class has to enforce separately, since it only ever calls
+    set_step() on the exact one step index a note actually landed on.
+
+    Always writes into the model's *own* `active_bank` (not a bank it
+    tracks itself, unlike LiveRecordSession) - since SequencerModel
+    already IS the single shared source of truth for which bank is
+    selected, and steps live directly in their bank with no "finalize on
+    switch" step needed, switching banks while armed here needs zero
+    extra code: the very next write just lands in whatever bank is now
+    active.
+
+    Deliberately independent of LiveRecordSession (the freeform,
+    unquantized MIDI take capture) - both can be armed from the exact
+    same "Record" button and read the exact same incoming event stream;
+    they just do two different things with it. Events tagged
+    `source="pattern"` (the sequencer's own notes) or any other
+    non-"external" source (e.g. take playback) are ignored, so this
+    can never write its own output - or a played-back take's - back
+    into the grid.
+    """
+
+    def __init__(self, model: SequencerModel):
+        self.model = model
+        self.armed = False
+        self._last_seen_ts = 0.0
+
+    def arm(self):
+        self.armed = True
+        self._last_seen_ts = time.time()
+
+    def disarm(self):
+        self.armed = False
+
+    def ingest(self, events, current_step: int):
+        """`events`: chronological SynthEngine.event_log-shaped dicts
+        (same shape LiveRecordSession.ingest() takes), each optionally
+        carrying `source` (treated as "external" if absent, so plain
+        board/Demo/Test-Note events - which don't set it - are
+        recordable by default; only the pattern's own playback and take
+        playback explicitly tag themselves otherwise).
+        `current_step`: SequencerPlayer.current_step at the moment this
+        is called - -1 (pattern not running) means there's nothing to
+        quantize against, so note_on events are skipped (but the cursor
+        still advances - they're not "missed", there's just no
+        meaningful step to write them to)."""
+        if not self.armed:
+            return
+        newest_ts = self._last_seen_ts
+        for e in events:
+            if e["t"] <= self._last_seen_ts:
+                continue
+            newest_ts = max(newest_ts, e["t"])
+            if e["kind"] != "note_on":
+                continue
+            if e.get("source", "external") != "external":
+                continue
+            if current_step < 0:
+                continue
+            velocity = e.get("velocity", 0)
+            accent = velocity >= STEP_RECORD_ACCENT_VELOCITY_THRESHOLD
+            self.model.set_step(self.model.active_bank, current_step, e["note"], accent=accent)
+        self._last_seen_ts = newest_ts
